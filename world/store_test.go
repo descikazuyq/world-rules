@@ -17,6 +17,9 @@ func TestMain(m *testing.M) {
 	case "concurrent_replace":
 		helperConcurrentReplace()
 		os.Exit(0)
+	case "concurrent_upgrade":
+		helperConcurrentUpgrade()
+		os.Exit(0)
 	default:
 		fmt.Fprintln(os.Stderr, "unknown helper")
 		os.Exit(2)
