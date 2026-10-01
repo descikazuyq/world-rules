@@ -25,5 +25,12 @@ go test ./...
   记录关系）与调用方给定的可接受规则版本集合；`RecoverLatest` 在最新
   记录损坏或版本不被接受时回溯最近一份可用历史记录，没有则返回
   `ErrUnrecoverable`。读取不改写任何数据。
+- `CheckUpgrade(slot, acceptedVersions, targetRules)` 检查槽当前最新
+  记录能否在目标规则下继续使用，返回记录标识、旧版本、目标版本、是否
+  兼容及具体阻碍；检查不改变世界、历史或槽当前记录。
+- `Upgrade(slot, acceptedVersions, targetRules, expectedRecordID)`
+  在检查通过后用目标规则生成一条新记录，以被升级记录为父，种子、时间
+  片、角色位置及物品数量和排列保持原样；预期标识为空或过期时冲突，
+  并发升级只有一个成功。
 - 写入通过目录内 flock 串行化，并以“临时文件写全 + 原子改名/硬链接”
   落盘，崩溃重开后只能看到旧的或新的完整记录。
