@@ -298,12 +298,333 @@ func TestReadVersionAndCorruptionRecovery(t *testing.T) {
 		t.Fatal("根记录读取错误")
 	}
 
-	// 最新记录被截断到无法解析时无法取得父指针，链无法继续 -> 不可恢复。
+	// 最新记录被截断到无法解析时，仍应越过它找到本槽更早的可用记录，
+	// 不能因为读不出父指针就提前放弃。
 	if err := os.Truncate(recordPath(dir, r2), 40); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := a.RecoverLatest("s", []string{"v1"}); !errors.Is(err, ErrUnrecoverable) {
-		t.Fatalf("链断裂无法继续时应不可恢复，得到 %T: %v", err, err)
+	rec3, err := a.RecoverLatest("s", []string{"v1"})
+	if err != nil {
+		t.Fatalf("最新记录损坏后应能恢复到更早的可用记录: %v", err)
+	}
+	if rec3.ID != r1.ID {
+		t.Fatalf("截断最新记录后应恢复到 r1，得到 %s", rec3.ID)
+	}
+}
+
+// TestRecoverLatestDeleteLatestRecord：最新记录文件被删除后，恢复应
+// 找到本槽更早的可用记录。
+func TestRecoverLatestDeleteLatestRecord(t *testing.T) {
+	a, dir := newTestArchive(t)
+	w := baseWorld(t)
+	r0, _ := a.Save("s", w)
+	cur, _ := a.Latest("s", []string{"v1"})
+	_, _ = w.Apply(Commit{Time: 1})
+	r1, _ := a.Replace("s", w, cur.ID)
+	cur, _ = a.Latest("s", []string{"v1"})
+	_, _ = w.Apply(Commit{Time: 2})
+	r2, _ := a.Replace("s", w, cur.ID)
+
+	// 删除最新记录文件（槽指针仍指向它）。
+	if err := os.Remove(recordPath(dir, r2.ID)); err != nil {
+		t.Fatal(err)
+	}
+	rec, err := a.RecoverLatest("s", []string{"v1"})
+	if err != nil {
+		t.Fatalf("删除最新记录后应恢复到 r1: %v", err)
+	}
+	if rec.ID != r1.ID {
+		t.Fatalf("应恢复到 r1，得到 %s", rec.ID)
+	}
+	// 重新打开存档后恢复结果一致。
+	a2, _ := Open(dir)
+	rec2, err := a2.RecoverLatest("s", []string{"v1"})
+	if err != nil {
+		t.Fatalf("重新打开后应恢复到 r1: %v", err)
+	}
+	if rec2.ID != r1.ID {
+		t.Fatalf("重新打开后应恢复到 r1，得到 %s", rec2.ID)
+	}
+	_ = r0
+}
+
+// TestRecoverLatestMultipleDamaged：最新记录与若干中间记录一起损坏后，
+// 恢复应找到最近一份完好且版本可接受的记录。
+func TestRecoverLatestMultipleDamaged(t *testing.T) {
+	a, dir := newTestArchive(t)
+	w := baseWorld(t)
+	r0, _ := a.Save("s", w)
+	cur, _ := a.Latest("s", []string{"v1"})
+	_, _ = w.Apply(Commit{Time: 1})
+	r1, _ := a.Replace("s", w, cur.ID)
+	cur, _ = a.Latest("s", []string{"v1"})
+	_, _ = w.Apply(Commit{Time: 2})
+	r2, _ := a.Replace("s", w, cur.ID)
+	cur, _ = a.Latest("s", []string{"v1"})
+	_, _ = w.Apply(Commit{Time: 3})
+	r3, _ := a.Replace("s", w, cur.ID)
+
+	// 损坏 r3（最新）和 r1（中间），保留 r2 和 r0。
+	tamperRecordChecksum(t, dir, r3.ID)
+	tamperRecordChecksum(t, dir, r1.ID)
+
+	rec, err := a.RecoverLatest("s", []string{"v1"})
+	if err != nil {
+		t.Fatalf("多条记录损坏后应恢复: %v", err)
+	}
+	if rec.ID != r2.ID {
+		t.Fatalf("应恢复到最近的完好记录 r2，得到 %s", rec.ID)
+	}
+	// r2 的内容完整保持该次保存的状态。
+	if rec.State.Time != 2 {
+		t.Fatalf("恢复记录的时间片应为 2，得到 %d", rec.State.Time)
+	}
+	_ = r0
+}
+
+// TestRecoverLatestTamperedParent：损坏记录的父标识被改成其他值时，
+// 恢复不能被引向别的槽，也不能遮住本槽更早的可用记录。
+func TestRecoverLatestTamperedParent(t *testing.T) {
+	a, dir := newTestArchive(t)
+	w := baseWorld(t)
+	r0, _ := a.Save("s", w)
+	cur, _ := a.Latest("s", []string{"v1"})
+	_, _ = w.Apply(Commit{Time: 1})
+	r1, _ := a.Replace("s", w, cur.ID)
+	cur, _ = a.Latest("s", []string{"v1"})
+	_, _ = w.Apply(Commit{Time: 2})
+	r2, _ := a.Replace("s", w, cur.ID)
+
+	// 先损坏 r2（篡改校验和），再把其父标识改成 r0。
+	tamperRecordChecksum(t, dir, r2.ID)
+	path := recordPath(dir, r2.ID)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tampered := strings.Replace(string(raw), `"parent": "`+string(r1.ID)+`"`,
+		`"parent": "`+string(r0.ID)+`"`, 1)
+	if tampered == string(raw) {
+		t.Fatal("测试前提：未找到父指针字段")
+	}
+	if err := os.WriteFile(path, []byte(tampered), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	rec, err := a.RecoverLatest("s", []string{"v1"})
+	if err != nil {
+		t.Fatalf("父标识被篡改后应恢复: %v", err)
+	}
+	if rec.ID != r1.ID {
+		t.Fatalf("应恢复到 r1（不被引向 r0），得到 %s", rec.ID)
+	}
+}
+
+// TestRecoverLatestTamperedSlotFirst：损坏记录的槽首标记被改成 true 时，
+// 恢复不能在该记录处提前停止，应继续找到本槽更早的可用记录。
+func TestRecoverLatestTamperedSlotFirst(t *testing.T) {
+	a, dir := newTestArchive(t)
+	w := baseWorld(t)
+	_, _ = a.Save("s", w)
+	cur, _ := a.Latest("s", []string{"v1"})
+	_, _ = w.Apply(Commit{Time: 1})
+	r1, _ := a.Replace("s", w, cur.ID)
+	cur, _ = a.Latest("s", []string{"v1"})
+	_, _ = w.Apply(Commit{Time: 2})
+	r2, _ := a.Replace("s", w, cur.ID)
+
+	// 损坏 r2 并把槽首标记改成 true。
+	tamperRecordChecksum(t, dir, r2.ID)
+	path := recordPath(dir, r2.ID)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tampered := strings.Replace(string(raw), `"slotFirst": false`,
+		`"slotFirst": true`, 1)
+	if tampered == string(raw) {
+		t.Fatal("测试前提：未找到 slotFirst 字段")
+	}
+	if err := os.WriteFile(path, []byte(tampered), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	rec, err := a.RecoverLatest("s", []string{"v1"})
+	if err != nil {
+		t.Fatalf("槽首标记被篡改后应恢复: %v", err)
+	}
+	if rec.ID != r1.ID {
+		t.Fatalf("应恢复到 r1（不被提前停止），得到 %s", rec.ID)
+	}
+}
+
+// TestRecoverLatestBranchBoundary：分支只查找分支自身已保存的记录，
+// 即使分支首条记录损坏也不越过分支边界；分支全无可用记录时返回
+// ErrUnrecoverable，其他槽不能替代。
+func TestRecoverLatestBranchBoundary(t *testing.T) {
+	a, dir := newTestArchive(t)
+	w := baseWorld(t)
+	r0, _ := a.Save("s", w)
+	cur, _ := a.Latest("s", []string{"v1"})
+	_, _ = w.Apply(Commit{Time: 1})
+	_, _ = a.Replace("s", w, cur.ID)
+
+	// 从 r0 分出分支 b。
+	b0, err := a.Branch("s", r0.ID, "b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	curB, _ := a.Latest("b", []string{"v1"})
+	wb, _ := WorldFromState(curB.State)
+	_, _ = wb.Apply(Commit{Time: 5})
+	b1, _ := a.Replace("b", wb, curB.ID)
+
+	// 损坏分支首条记录 b0。
+	tamperRecordChecksum(t, dir, b0.ID)
+
+	// 恢复分支应找到 b1，不跨入来源槽 s。
+	rec, err := a.RecoverLatest("b", []string{"v1"})
+	if err != nil {
+		t.Fatalf("分支首条记录损坏后应恢复到 b1: %v", err)
+	}
+	if rec.ID != b1.ID {
+		t.Fatalf("应恢复到分支自身的 b1，得到 %s", rec.ID)
+	}
+	if rec.State.Time != 5 {
+		t.Fatalf("分支记录时间片应为 5，得到 %d", rec.State.Time)
+	}
+
+	// 损坏分支全部记录。
+	tamperRecordChecksum(t, dir, b1.ID)
+	_, err = a.RecoverLatest("b", []string{"v1"})
+	if !errors.Is(err, ErrUnrecoverable) {
+		t.Fatalf("分支全无可用记录应返回 ErrUnrecoverable，得到 %T: %v", err, err)
+	}
+	// 来源槽 s 即使种子和规则相同也不能替代。
+	_, err = a.RecoverLatest("s", []string{"v1"})
+	if err != nil {
+		t.Fatalf("来源槽 s 应可正常恢复: %v", err)
+	}
+}
+
+// TestRecoverLatestOldArchiveAdoption：旧存档（指针未携带历史）在第一次
+// 成功覆盖后，原有历史与新增记录都获得恢复能力。
+func TestRecoverLatestOldArchiveAdoption(t *testing.T) {
+	a, dir := newTestArchive(t)
+	w := baseWorld(t)
+	_, _ = a.Save("s", w)
+	cur, _ := a.Latest("s", []string{"v1"})
+	_, _ = w.Apply(Commit{Time: 1})
+	r1, _ := a.Replace("s", w, cur.ID)
+
+	// 模拟旧存档：清除指针内嵌的历史。
+	clearPointerHistory(t, a, "s")
+
+	// 第一次成功覆盖：收养原有历史并写入新记录。
+	cur, _ = a.Latest("s", []string{"v1"})
+	_, _ = w.Apply(Commit{Time: 2})
+	r2, err := a.Replace("s", w, cur.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 损坏最新记录 r2，恢复应找到 r1。
+	tamperRecordChecksum(t, dir, r2.ID)
+	rec, err := a.RecoverLatest("s", []string{"v1"})
+	if err != nil {
+		t.Fatalf("旧存档收养后应能恢复: %v", err)
+	}
+	if rec.ID != r1.ID {
+		t.Fatalf("应恢复到 r1，得到 %s", rec.ID)
+	}
+
+	// 重新打开存档后恢复结果一致。
+	a2, _ := Open(dir)
+	rec2, err := a2.RecoverLatest("s", []string{"v1"})
+	if err != nil {
+		t.Fatalf("重新打开后应能恢复: %v", err)
+	}
+	if rec2.ID != r1.ID {
+		t.Fatalf("重新打开后应恢复到 r1，得到 %s", rec2.ID)
+	}
+}
+
+// TestRecoverLatestOrphanNotSelected：只有记录文件写完、尚未完成保存的
+// 残留文件不能被选中。
+func TestRecoverLatestOrphanNotSelected(t *testing.T) {
+	a, _ := newTestArchive(t)
+	w := baseWorld(t)
+	r0, _ := a.Save("s", w)
+
+	// 写入一条记录文件但不更新槽指针（模拟崩溃残留）。
+	_, _ = w.Apply(Commit{Time: 1})
+	orphan := writeRawRecord(t, a, r0.ID, false, w.Snapshot())
+
+	rec, err := a.RecoverLatest("s", []string{"v1"})
+	if err != nil {
+		t.Fatalf("应恢复到 r0: %v", err)
+	}
+	if rec.ID != r0.ID {
+		t.Fatalf("残留记录不应被选中，应恢复到 r0，得到 %s", rec.ID)
+	}
+	_ = orphan
+}
+
+// TestRecoverLatestVersionRejectedSkipped：版本不被接受的记录继续跳过，
+// 不自动升级。
+func TestRecoverLatestVersionRejectedSkipped(t *testing.T) {
+	a, _ := newTestArchive(t)
+	w := baseWorld(t)
+	_, _ = a.Save("s", w)
+	cur, _ := a.Latest("s", []string{"v1"})
+	_, _ = w.Apply(Commit{Time: 1})
+	r1, _ := a.Replace("s", w, cur.ID)
+
+	// 写入一条 v2 的最新记录。
+	v2State := w.Snapshot()
+	v2State.Time = 2
+	v2State.Rules.Version = "v2"
+	r2 := writeRawRecord(t, a, r1.ID, false, v2State)
+	updatePointer(t, a, "s", r2)
+
+	// 只接受 v1 时应跳过 v2 找到 r1。
+	rec, err := a.RecoverLatest("s", []string{"v1"})
+	if err != nil {
+		t.Fatalf("应恢复到 v1 记录: %v", err)
+	}
+	if rec.ID != r1.ID {
+		t.Fatalf("应恢复到 r1，得到 %s", rec.ID)
+	}
+	if rec.State.Rules.Version != "v1" {
+		t.Fatal("恢复不应替换记录中的规则版本")
+	}
+}
+
+// TestRecoverLatestUpgradeRecord：规则升级产生的记录损坏后，恢复应
+// 找到升级前最近一份版本可接受的记录。
+func TestRecoverLatestUpgradeRecord(t *testing.T) {
+	a, dir := newTestArchive(t)
+	w := baseWorld(t)
+	info, _ := a.Save("s", w)
+	if _, err := a.Upgrade("s", []string{"v1"}, v2Rules(), info.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	// 损坏升级后的最新记录。
+	latest, _ := a.Latest("s", []string{"v1", "v2"})
+	tamperRecordChecksum(t, dir, latest.ID)
+
+	// 只接受 v1 时应恢复到升级前的记录。
+	rec, err := a.RecoverLatest("s", []string{"v1"})
+	if err != nil {
+		t.Fatalf("升级记录损坏后应恢复到升级前记录: %v", err)
+	}
+	if rec.ID != info.ID {
+		t.Fatalf("应恢复到升级前记录 %s，得到 %s", info.ID, rec.ID)
+	}
+	// 恢复记录的种子、规则、角色、物品及时间片完整保持该次保存的内容。
+	if rec.State.Seed != 42 || rec.State.Rules.Version != "v1" {
+		t.Fatalf("恢复记录内容不完整: %+v", rec.State)
 	}
 }
 
@@ -458,7 +779,44 @@ func writeRawRecord(t *testing.T, a *Archive, parent RecordID, first bool, st St
 
 func updatePointer(t *testing.T, a *Archive, slot string, id RecordID) {
 	t.Helper()
-	if err := a.replaceSlotPointer(slot, id); err != nil {
+	p, err := a.readPointerLocked(slot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.replaceSlotPointer(slot, id, p.History); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// tamperRecordChecksum 篡改一条记录的校验和，使其内容损坏但仍可解析。
+func tamperRecordChecksum(t *testing.T, dir string, id RecordID) {
+	t.Helper()
+	path := recordPath(dir, id)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(raw)
+	i := strings.Index(s, `"checksum": "`)
+	if i < 0 {
+		t.Fatal("找不到 checksum 字段")
+	}
+	start := i + len(`"checksum": "`)
+	end := start + 64
+	s = s[:start] + strings.Repeat("0", 64) + s[end:]
+	if err := os.WriteFile(path, []byte(s), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// clearPointerHistory 清除槽指针内嵌的历史，模拟旧存档（指针未携带历史）。
+func clearPointerHistory(t *testing.T, a *Archive, slot string) {
+	t.Helper()
+	p, err := a.readPointerLocked(slot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.replaceSlotPointer(slot, p.Latest, nil); err != nil {
 		t.Fatal(err)
 	}
 }

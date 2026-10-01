@@ -215,11 +215,11 @@ func (a *Archive) Upgrade(slot string, acceptedVersions []string, target Rules, 
 	}
 	defer lock.release()
 
-	latest, err := a.readLatestLocked(slot)
+	p, err := a.readPointerLocked(slot)
 	if err != nil {
 		return UpgradeResult{}, err
 	}
-	if latest != expected {
+	if p.Latest != expected {
 		return UpgradeResult{}, &ConflictError{
 			Slot:   slot,
 			Reason: "所依据的记录已不是该槽最新记录",
@@ -257,7 +257,11 @@ func (a *Archive) Upgrade(slot string, acceptedVersions []string, target Rules, 
 	if err := writeRecord(a.dir, newEnv); err != nil {
 		return UpgradeResult{}, err
 	}
-	if err := a.replaceSlotPointer(slot, id); err != nil {
+	history, err := a.buildNewHistoryLocked(slot, p, id)
+	if err != nil {
+		return UpgradeResult{}, err
+	}
+	if err := a.replaceSlotPointer(slot, id, history); err != nil {
 		return UpgradeResult{}, err
 	}
 	info := RecordInfo{
