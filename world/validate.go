@@ -1,6 +1,9 @@
 package world
 
-import "fmt"
+import (
+	"fmt"
+	"math/big"
+)
 
 // RuleError 表示数据或提交违反了世界规则。
 type RuleError struct {
@@ -88,7 +91,6 @@ func validateCharacters(chars []Character, r Rules) error {
 			return ruleErrorf("角色 %q 位于不存在的地点: %q", c.ID, c.Location)
 		}
 		seen := make(map[string]struct{}, len(c.Items))
-		total := 0
 		for _, it := range c.Items {
 			if _, ok := kindSet[it.Item]; !ok {
 				return ruleErrorf("角色 %q 持有规则不允许的物品: %q", c.ID, it.Item)
@@ -100,11 +102,17 @@ func validateCharacters(chars []Character, r Rules) error {
 			if it.Count < 0 {
 				return ruleErrorf("角色 %q 的物品 %q 数量不能为负: %d", c.ID, it.Item, it.Count)
 			}
-			total += it.Count
 		}
-		limit, hasLimit := r.CarryLimits[c.ID]
-		if hasLimit && total > limit {
-			return ruleErrorf("角色 %q 携带总量 %d 超过上限 %d", c.ID, total, limit)
+		// 携带上限按真实总量判断：精确求和，不因加法回绕而放过超限。
+		// 未设上限的角色不检查总量，其总量允许超过 int 最大值。
+		if limit, hasLimit := r.CarryLimits[c.ID]; hasLimit {
+			total := new(big.Int)
+			for _, it := range c.Items {
+				total.Add(total, bigInt(it.Count))
+			}
+			if total.Cmp(bigInt(limit)) > 0 {
+				return ruleErrorf("角色 %q 携带总量 %s 超过上限 %d", c.ID, total.String(), limit)
+			}
 		}
 	}
 	return nil

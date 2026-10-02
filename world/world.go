@@ -1,5 +1,7 @@
 package world
 
+import "math/big"
+
 // World 是一个本地世界实例。它持有当前完整状态，零值不可用，
 // 必须通过 NewWorld 建立。
 type World struct {
@@ -45,8 +47,10 @@ func (w *World) Snapshot() State {
 // Apply 在一次原子提交中应用若干移动、物品数量变化和时间推进。
 //
 // 提交中的任意一项不合法（角色/物品不存在、移动不沿允许的连通关系、
-// 物品数量变负、总量超过携带上限、时间倒退等）都会使整次提交失败，
-// 世界保持提交前状态。成功时返回提交后的状态深拷贝。
+// 物品最终数量为负或超出 int 范围、真实总量超过携带上限、时间倒退等）
+// 都会使整次提交失败，世界保持提交前状态。同一角色同一物品的全部增减
+// 与原始数量合并后判断最终结果，中途暂时为负或超出 int 范围不失败，
+// 增减条目次序不影响成败与最终数量。成功时返回提交后的状态深拷贝。
 func (w *World) Apply(c Commit) (State, error) {
 	next, err := w.state.apply(c)
 	if err != nil {
@@ -92,7 +96,12 @@ func (s State) apply(c Commit) (State, error) {
 		ch.Location = m.To
 	}
 
-	// 物品数量变化：先在工作副本上累计，最后统一校验非负与上限。
+	// 物品数量变化：同一角色同一物品的全部增减先与原始数量合并（精确整数
+	// 运算，不回绕），再统一判断最终结果。中途暂时为负或超出 int 范围都
+	// 不失败，因此增减条目的次序不影响成败与最终数量。不存在的角色与不被
+	// 规则允许的物品仍按条目拒绝，即使其增减相互抵消。
+	totals := make(map[string]map[string]*big.Int, len(next.Characters))
+	extras := make(map[string][]string)
 	for _, ic := range c.ItemChanges {
 		ch, ok := chars[ic.Character]
 		if !ok {
@@ -102,30 +111,58 @@ func (s State) apply(c Commit) (State, error) {
 			return State{}, ruleErrorf("角色 %q 的物品变化引用了规则不允许的物品: %q",
 				ic.Character, ic.Item)
 		}
-		idx := -1
-		for i := range ch.Items {
-			if ch.Items[i].Item == ic.Item {
-				idx = i
-				break
+		items, ok := totals[ic.Character]
+		if !ok {
+			items = make(map[string]*big.Int, len(ch.Items)+1)
+			for _, it := range ch.Items {
+				items[it.Item] = bigInt(it.Count)
 			}
+			totals[ic.Character] = items
 		}
-		if idx == -1 {
-			ch.Items = append(ch.Items, CharacterItem{Item: ic.Item, Count: ic.Delta})
-		} else {
-			ch.Items[idx].Count += ic.Delta
+		acc, ok := items[ic.Item]
+		if !ok {
+			acc = new(big.Int)
+			items[ic.Item] = acc
+			extras[ic.Character] = append(extras[ic.Character], ic.Item)
+		}
+		acc.Add(acc, bigInt(ic.Delta))
+	}
+	// 把合并后的最终数量写回工作副本：已有条目保持原位，新物品按增减
+	// 条目首次出现的次序追加，零数量条目照常保留。
+	for i := range next.Characters {
+		ch := &next.Characters[i]
+		items, ok := totals[ch.ID]
+		if !ok {
+			continue
+		}
+		for j := range ch.Items {
+			count, err := finalCount(ch.ID, ch.Items[j].Item, items[ch.Items[j].Item])
+			if err != nil {
+				return State{}, err
+			}
+			ch.Items[j].Count = count
+		}
+		for _, name := range extras[ch.ID] {
+			count, err := finalCount(ch.ID, name, items[name])
+			if err != nil {
+				return State{}, err
+			}
+			ch.Items = append(ch.Items, CharacterItem{Item: name, Count: count})
 		}
 	}
+	// 携带上限按真实总量判断：精确求和，不因加法回绕而放过超限。未设
+	// 上限的角色不检查总量，其总量允许超过 int 最大值。
 	for _, ch := range next.Characters {
-		total := 0
-		for _, it := range ch.Items {
-			if it.Count < 0 {
-				return State{}, ruleErrorf("角色 %q 的物品 %q 数量不能为负: %d",
-					ch.ID, it.Item, it.Count)
-			}
-			total += it.Count
+		limit, ok := next.Rules.CarryLimits[ch.ID]
+		if !ok {
+			continue
 		}
-		if limit, ok := next.Rules.CarryLimits[ch.ID]; ok && total > limit {
-			return State{}, ruleErrorf("角色 %q 携带总量 %d 超过上限 %d", ch.ID, total, limit)
+		total := new(big.Int)
+		for _, it := range ch.Items {
+			total.Add(total, bigInt(it.Count))
+		}
+		if total.Cmp(bigInt(limit)) > 0 {
+			return State{}, ruleErrorf("角色 %q 携带总量 %s 超过上限 %d", ch.ID, total.String(), limit)
 		}
 	}
 

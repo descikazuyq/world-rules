@@ -2,6 +2,7 @@ package world
 
 import (
 	"fmt"
+	"math/big"
 	"sort"
 )
 
@@ -27,8 +28,16 @@ type Blocker struct {
 	Location string
 	// Item 是被移除的物品种类（Kind 为 BlockerItem 时有值）。
 	Item string
-	// Total 是角色当前携带总量（Kind 为 BlockerLimit 时有值）。
+	// Total 是角色当前携带总量（Kind 为 BlockerLimit 且 TotalOverflow
+	// 为 false 时有值，此时它就是真实总量）。
 	Total int
+	// TotalOverflow 表示真实携带总量超出 int 能表示的范围（来源规则未设
+	// 上限时可能出现）：此时 Total 不代表实际总量，调用方应改用
+	// TotalText 给出的完整十进制真实总量。
+	TotalOverflow bool
+	// TotalText 是真实携带总量的完整十进制表示（仅 TotalOverflow 为
+	// true 时有值）。
+	TotalText string
 	// Limit 是目标规则给出的新上限（Kind 为 BlockerLimit 时有值）。
 	Limit int
 }
@@ -58,9 +67,11 @@ type UpgradeResult struct {
 // checkCompatibility 计算用 target 规则原样承接 st 中全部角色状态的阻碍。
 //
 // 兼容只判断能否原样承接当前角色状态：每个角色所在地点仍存在，已列出的
-// 物品种类仍被允许（数量为零也算），各角色携带总量不超过目标上限；目标中
-// 没有该角色上限时表示不设上限。允许删去无人所在的地点、不再出现的物品种
-// 类或旧连通关系，也允许增加内容。升级后移动和物品变化按目标规则处理。
+// 物品种类仍被允许（数量为零也算），各角色携带总量不超过目标上限（按真实
+// 总量精确求和，不因回绕放过超限；真实总量超出 int 范围时阻碍置
+// TotalOverflow 并以 TotalText 给出完整十进制总量）；目标中没有该角色上限
+// 时表示不设上限。允许删去无人所在的地点、不再出现的物品种类或旧连通关系，
+// 也允许增加内容。升级后移动和物品变化按目标规则处理。
 func checkCompatibility(st State, target Rules) []Blocker {
 	locSet := make(map[string]struct{}, len(target.Locations))
 	for _, l := range target.Locations {
@@ -79,7 +90,7 @@ func checkCompatibility(st State, target Rules) []Blocker {
 				Location:  ch.Location,
 			})
 		}
-		total := 0
+		total := new(big.Int)
 		for _, it := range ch.Items {
 			if _, ok := kindSet[it.Item]; !ok {
 				blockers = append(blockers, Blocker{
@@ -88,15 +99,24 @@ func checkCompatibility(st State, target Rules) []Blocker {
 					Item:      it.Item,
 				})
 			}
-			total += it.Count
+			total.Add(total, bigInt(it.Count))
 		}
-		if limit, ok := target.CarryLimits[ch.ID]; ok && total > limit {
-			blockers = append(blockers, Blocker{
+		// 携带上限按真实总量判断：精确求和，不因加法回绕而放过超限。
+		// 真实总量能用 int 表示时沿用 Total 字段；超出 int 范围时置
+		// TotalOverflow 并给出完整十进制 TotalText。
+		if limit, ok := target.CarryLimits[ch.ID]; ok && total.Cmp(bigInt(limit)) > 0 {
+			b := Blocker{
 				Character: ch.ID,
 				Kind:      BlockerLimit,
-				Total:     total,
 				Limit:     limit,
-			})
+			}
+			if total.Cmp(maxIntBig) <= 0 {
+				b.Total = int(total.Int64())
+			} else {
+				b.TotalOverflow = true
+				b.TotalText = total.String()
+			}
+			blockers = append(blockers, b)
 		}
 	}
 	// 同类问题按角色标识、物品标识排序；location/limit 阻碍没有物品标识，
