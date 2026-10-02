@@ -30,6 +30,14 @@ go test ./...
   引向别的槽。分支只在分支自身的记录中查找，越界不查；没有任何可用
   记录时返回 `ErrUnrecoverable`。旧版本裸指针可直接打开，第一次成功
   覆盖或升级后旧历史即获得同样的恢复能力。读取不改写任何数据。
+- `PreviewRecover(slot, acceptedVersions)` 只读预览恢复：返回槽当前指向
+  的记录标识、按保存生效次序选中的来源记录标识及其完整世界状态；选择
+  规则与 `RecoverLatest` 相同，预览不改变存档。
+- `ConfirmRecover(slot, current, source, acceptedVersions)` 确认恢复：
+  槽指针仍指向 current 时（即使该记录已损坏或被删除），把仍属于本槽
+  历史、校验通过且版本可接受的 source 正式保存为一条新记录；父记录是
+  选中的来源，状态原样复制（允许时间片回到来源时刻），旧历史按原次序
+  保留。并发确认及确认与覆盖/升级竞争时基于同一当前标识最多一个成功。
 - `CheckUpgrade(slot, acceptedVersions, targetRules)` 检查槽当前最新
   记录能否在目标规则下继续使用，返回记录标识、旧版本、目标版本、是否
   兼容及具体阻碍；检查不改变世界、历史或槽当前记录。
