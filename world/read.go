@@ -224,29 +224,45 @@ func (a *Archive) RecoverLatest(slot string, acceptedVersions []string) (Record,
 		return Record{}, err
 	}
 
+	env, err := a.firstRecoverableLocked(history, acceptedVersions)
+	if err != nil {
+		var ue *UnrecoverableError
+		if errors.As(err, &ue) {
+			ue.Slot = slot
+		}
+		return Record{}, err
+	}
+	return envToRecord(env), nil
+}
+
+// firstRecoverableLocked 在调用方已持锁的前提下，按给定的保存生效次序
+// （最新在前）返回第一份“内容与父关系校验通过且规则版本可接受”的记录。
+//
+// 文件缺失、截断、校验和不符、记录标识不符、父关系异常或世界状态不自洽
+// 的记录一律越过（不读其中的父标识或槽首标记）；版本不被接受的记录也
+// 越过且不自动升级。次序完全由调用方给出（来自槽指针历史索引或沿可信
+// 父链的重建），因此不会被引向别的槽。没有任何可用记录时返回包装了
+// ErrUnrecoverable 的 *UnrecoverableError（Slot 字段由调用方补全）。
+func (a *Archive) firstRecoverableLocked(history []RecordID, acceptedVersions []string) (*envelope, error) {
 	var lastReason string
 	for _, id := range history {
 		env, verifyErr := a.loadAndVerifyLocked(id)
 		if verifyErr != nil {
-			// 文件缺失、无法解析、校验和不符、记录标识不符、父记录关系
-			// 异常或世界状态不自洽：受损记录不能成为恢复结果，越过它
-			// 继续看更早的记录（不读其中的父标识或槽首标记）。
 			lastReason = verifyErr.Error()
 			continue
 		}
 		if !versionAccepted(env.State.Rules.Version, acceptedVersions) {
-			// 版本不被接受：跳过，不自动升级。
 			lastReason = (&VersionRejectedError{
 				Record:  id,
 				Version: env.State.Rules.Version,
 			}).Error()
 			continue
 		}
-		return envToRecord(env), nil
+		return env, nil
 	}
 
 	if lastReason == "" {
 		lastReason = "槽中没有任何可确认归属的历史记录"
 	}
-	return Record{}, &UnrecoverableError{Slot: slot, Reason: lastReason}
+	return nil, &UnrecoverableError{Reason: lastReason}
 }
