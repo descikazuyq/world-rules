@@ -2,6 +2,7 @@ package world
 
 import (
 	"fmt"
+	"math/big"
 	"sort"
 )
 
@@ -28,7 +29,14 @@ type Blocker struct {
 	// Item 是被移除的物品种类（Kind 为 BlockerItem 时有值）。
 	Item string
 	// Total 是角色当前携带总量（Kind 为 BlockerLimit 时有值）。
+	// 总量能被 int 表示时即为真实总量；超出 int 范围时为零，
+	// 真实总量以 TotalExact 为准。
 	Total int
+	// TotalExact 是携带总量超出 int 范围时的完整十进制真实总量
+	// （Kind 为 BlockerLimit 时有值）。总量能被 int 表示时为空，
+	// 此时 Total 即为真实总量。调用方可用本字段判断现有 int 字段
+	// 能否代表实际总量。
+	TotalExact string
 	// Limit 是目标规则给出的新上限（Kind 为 BlockerLimit 时有值）。
 	Limit int
 }
@@ -79,7 +87,7 @@ func checkCompatibility(st State, target Rules) []Blocker {
 				Location:  ch.Location,
 			})
 		}
-		total := 0
+		total := new(big.Int)
 		for _, it := range ch.Items {
 			if _, ok := kindSet[it.Item]; !ok {
 				blockers = append(blockers, Blocker{
@@ -88,15 +96,20 @@ func checkCompatibility(st State, target Rules) []Blocker {
 					Item:      it.Item,
 				})
 			}
-			total += it.Count
+			total.Add(total, big.NewInt(int64(it.Count)))
 		}
-		if limit, ok := target.CarryLimits[ch.ID]; ok && total > limit {
-			blockers = append(blockers, Blocker{
+		if limit, ok := target.CarryLimits[ch.ID]; ok && total.Cmp(big.NewInt(int64(limit))) > 0 {
+			b := Blocker{
 				Character: ch.ID,
 				Kind:      BlockerLimit,
-				Total:     total,
 				Limit:     limit,
-			})
+			}
+			if fitsInInt(total) {
+				b.Total = int(total.Int64())
+			} else {
+				b.TotalExact = total.String()
+			}
+			blockers = append(blockers, b)
 		}
 	}
 	// 同类问题按角色标识、物品标识排序；location/limit 阻碍没有物品标识，

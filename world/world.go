@@ -1,5 +1,7 @@
 package world
 
+import "math/big"
+
 // World 是一个本地世界实例。它持有当前完整状态，零值不可用，
 // 必须通过 NewWorld 建立。
 type World struct {
@@ -92,40 +94,68 @@ func (s State) apply(c Commit) (State, error) {
 		ch.Location = m.To
 	}
 
-	// 物品数量变化：先在工作副本上累计，最后统一校验非负与上限。
+	// 物品数量变化：先按角色+物品种类合并同批全部增减量，再与原数量合并
+	// 判断最终结果。中途暂时为负或超出 int 范围都允许，只要最终数量合法
+	// （非负且能被 int 表示）且符合携带上限；增减次序不影响成败与最终数量。
+	type itemKey struct {
+		char string
+		item string
+	}
+	deltas := make(map[itemKey]*big.Int)
 	for _, ic := range c.ItemChanges {
-		ch, ok := chars[ic.Character]
-		if !ok {
+		if _, ok := chars[ic.Character]; !ok {
 			return State{}, ruleErrorf("物品变化引用了不存在的角色: %q", ic.Character)
 		}
 		if _, ok := kindSet[ic.Item]; !ok {
 			return State{}, ruleErrorf("角色 %q 的物品变化引用了规则不允许的物品: %q",
 				ic.Character, ic.Item)
 		}
-		idx := -1
-		for i := range ch.Items {
-			if ch.Items[i].Item == ic.Item {
-				idx = i
-				break
-			}
+		key := itemKey{ic.Character, ic.Item}
+		if deltas[key] == nil {
+			deltas[key] = new(big.Int)
 		}
-		if idx == -1 {
-			ch.Items = append(ch.Items, CharacterItem{Item: ic.Item, Count: ic.Delta})
-		} else {
-			ch.Items[idx].Count += ic.Delta
-		}
+		deltas[key].Add(deltas[key], big.NewInt(int64(ic.Delta)))
 	}
-	for _, ch := range next.Characters {
-		total := 0
+
+	// 逐角色合并原数量与增减量，校验最终数量与携带总量。
+	for ci := range next.Characters {
+		ch := &next.Characters[ci]
+		finalByName := make(map[string]*big.Int, len(ch.Items))
+		order := make([]string, 0, len(ch.Items))
 		for _, it := range ch.Items {
-			if it.Count < 0 {
-				return State{}, ruleErrorf("角色 %q 的物品 %q 数量不能为负: %d",
-					ch.ID, it.Item, it.Count)
-			}
-			total += it.Count
+			finalByName[it.Item] = big.NewInt(int64(it.Count))
+			order = append(order, it.Item)
 		}
-		if limit, ok := next.Rules.CarryLimits[ch.ID]; ok && total > limit {
-			return State{}, ruleErrorf("角色 %q 携带总量 %d 超过上限 %d", ch.ID, total, limit)
+		for key, d := range deltas {
+			if key.char != ch.ID {
+				continue
+			}
+			if _, ok := finalByName[key.item]; !ok {
+				finalByName[key.item] = new(big.Int)
+				order = append(order, key.item)
+			}
+			finalByName[key.item].Add(finalByName[key.item], d)
+			delete(deltas, key)
+		}
+
+		items := make([]CharacterItem, 0, len(order))
+		total := new(big.Int)
+		for _, name := range order {
+			final := finalByName[name]
+			if final.Sign() < 0 {
+				return State{}, ruleErrorf("角色 %q 的物品 %q 最终数量不能为负: %s",
+					ch.ID, name, final.String())
+			}
+			if !fitsInInt(final) {
+				return State{}, ruleErrorf("角色 %q 的物品 %q 最终数量超出整数范围",
+					ch.ID, name)
+			}
+			items = append(items, CharacterItem{Item: name, Count: int(final.Int64())})
+			total.Add(total, final)
+		}
+		ch.Items = items
+		if limit, ok := next.Rules.CarryLimits[ch.ID]; ok && total.Cmp(big.NewInt(int64(limit))) > 0 {
+			return State{}, ruleErrorf("角色 %q 携带总量 %s 超过上限 %d", ch.ID, total.String(), limit)
 		}
 	}
 
