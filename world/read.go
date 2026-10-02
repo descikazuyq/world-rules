@@ -156,8 +156,10 @@ func (a *Archive) Record(slot string, id RecordID, acceptedVersions []string) (R
 	return envToRecord(env), nil
 }
 
-// History 返回槽的历史记录元信息，最新在前，到该槽首条记录为止
-// （不会跨入分支来源槽）。该方法只做只读遍历，不改写任何数据。
+// History 返回槽的历史记录元信息，按该槽保存生效的次序排列（最新在
+// 前），到槽首条记录为止；分支槽只含它自己保存成功的记录，不会跨入
+// 分支来源槽。次序来自槽指针内嵌的历史索引，与文件修改时间无关。该
+// 方法只做只读遍历，不改写任何数据；无法解析的记录会被略过。
 func (a *Archive) History(slot string) ([]RecordInfo, error) {
 	if !validSlotName(slot) {
 		return nil, &NotFoundError{Slot: slot}
@@ -168,15 +170,15 @@ func (a *Archive) History(slot string) ([]RecordInfo, error) {
 	}
 	defer lock.release()
 
-	chain, err := a.slotChainLocked(slot)
+	history, err := a.slotHistoryLocked(slot)
 	if err != nil {
 		return nil, err
 	}
-	infos := make([]RecordInfo, 0, len(chain))
-	for _, id := range chain {
+	infos := make([]RecordInfo, 0, len(history))
+	for _, id := range history {
 		env, err := loadRecord(recordPath(a.dir, id))
 		if err != nil {
-			break
+			continue
 		}
 		infos = append(infos, RecordInfo{
 			ID:        env.ID,
@@ -188,13 +190,25 @@ func (a *Archive) History(slot string) ([]RecordInfo, error) {
 	return infos, nil
 }
 
-// RecoverLatest 在最新记录损坏或版本不被接受时，沿历史链（最新在前）
-// 寻找最近一份“内容校验通过且规则版本可接受”的记录并返回。
+// RecoverLatest 返回该槽“按保存生效次序最近的一份”内容校验通过且规则
+// 版本可接受的已保存记录。
 //
-// 最新记录本身可用时，返回结果等同于 Latest。链上更老的损坏记录若仍能
-// 解析出父指针，则继续越过它向前查找；没有任何可接受记录时返回包装了
-// ErrUnrecoverable 的 *UnrecoverableError，可用 errors.Is(err,
-// ErrUnrecoverable) 判断。恢复读取不会改写槽、历史记录或规则。
+// 遍历次序完全来自槽指针维护的历史索引（最新在前），既不依据文件修改
+// 时间，也不读取受损记录里的父标识或槽首标记：因此最新记录被删除、
+// 截断成无法解析的内容，或连同若干中间记录一起损坏时，仍能越过它们
+// 找到本槽更早的可用记录，而不会被引向别的槽或遮住更早的可用记录。
+// 与世界时间片的大小无关。
+//
+// 分支槽只在分支自身已成功保存的记录中查找；即使分支首条记录损坏也不
+// 越过分支边界，其他槽即使种子和规则相同也不会替代。版本不被接受的
+// 记录一律跳过且不自动升级。只有记录文件写完且指针已更新（即保存完整
+// 生效）的记录才在候选中：残留临时文件、写完但尚未完成保存的孤儿记录
+// 不会被选中。
+//
+// 槽不存在返回 *NotFoundError；槽指针不可读返回 *CorruptError；槽中没有
+// 任何版本可接受的完好记录时返回包装了 ErrUnrecoverable 的
+// *UnrecoverableError，可用 errors.Is(err, ErrUnrecoverable) 判断。
+// 恢复读取不会改写槽、指针、历史记录或规则，重复读取也不消耗历史。
 func (a *Archive) RecoverLatest(slot string, acceptedVersions []string) (Record, error) {
 	if !validSlotName(slot) {
 		return Record{}, &NotFoundError{Slot: slot}
@@ -205,54 +219,34 @@ func (a *Archive) RecoverLatest(slot string, acceptedVersions []string) (Record,
 	}
 	defer lock.release()
 
-	latest, err := a.readLatestLocked(slot)
+	history, err := a.slotHistoryLocked(slot)
 	if err != nil {
 		return Record{}, err
 	}
 
 	var lastReason string
-	cur := latest
-	seen := map[RecordID]bool{}
-	for cur != "" {
-		if seen[cur] {
-			return Record{}, &UnrecoverableError{Slot: slot, Reason: "历史链出现环"}
+	for _, id := range history {
+		env, verifyErr := a.loadAndVerifyLocked(id)
+		if verifyErr != nil {
+			// 文件缺失、无法解析、校验和不符、记录标识不符、父记录关系
+			// 异常或世界状态不自洽：受损记录不能成为恢复结果，越过它
+			// 继续看更早的记录（不读其中的父标识或槽首标记）。
+			lastReason = verifyErr.Error()
+			continue
 		}
-		seen[cur] = true
-
-		// raw 用于在记录损坏时仍可能取得父指针与槽首标记，
-		// 从而越过损坏记录继续向前、且不跨入分支来源槽。
-		raw, rawErr := loadRecord(recordPath(a.dir, cur))
-		env, verifyErr := a.loadAndVerifyLocked(cur)
-
-		if verifyErr == nil && versionAccepted(env.State.Rules.Version, acceptedVersions) {
-			return envToRecord(env), nil
-		}
-		switch {
-		case verifyErr == nil:
+		if !versionAccepted(env.State.Rules.Version, acceptedVersions) {
+			// 版本不被接受：跳过，不自动升级。
 			lastReason = (&VersionRejectedError{
-				Record:  cur,
+				Record:  id,
 				Version: env.State.Rules.Version,
 			}).Error()
-		default:
-			lastReason = verifyErr.Error()
+			continue
 		}
-
-		// 无论本记录是否损坏，槽首记录之后都不再跨入来源槽。
-		if rawErr == nil && raw.SlotFirst {
-			break
-		}
-		if rawErr == nil {
-			cur = raw.Parent
-		} else {
-			cur = ""
-		}
+		return envToRecord(env), nil
 	}
 
 	if lastReason == "" {
-		lastReason = "空槽或没有任何历史记录"
+		lastReason = "槽中没有任何可确认归属的历史记录"
 	}
-	return Record{}, &UnrecoverableError{
-		Slot:   slot,
-		Reason: lastReason,
-	}
+	return Record{}, &UnrecoverableError{Slot: slot, Reason: lastReason}
 }

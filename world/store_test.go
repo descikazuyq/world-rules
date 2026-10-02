@@ -298,12 +298,29 @@ func TestReadVersionAndCorruptionRecovery(t *testing.T) {
 		t.Fatal("根记录读取错误")
 	}
 
-	// 最新记录被截断到无法解析时无法取得父指针，链无法继续 -> 不可恢复。
+	// 最新记录被截断到无法解析时，历史索引仍保留保存次序，恢复应越过
+	// 它找到更早的可用记录（不能因为读不出父标识就放弃）。
 	if err := os.Truncate(recordPath(dir, r2), 40); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := a.RecoverLatest("s", []string{"v1"}); !errors.Is(err, ErrUnrecoverable) {
-		t.Fatalf("链断裂无法继续时应不可恢复，得到 %T: %v", err, err)
+	rec3, err := a.RecoverLatest("s", []string{"v1"})
+	if err != nil {
+		t.Fatalf("最新记录被截断成无法解析的内容时仍应恢复到更早记录: %v", err)
+	}
+	if rec3.ID != r1.ID {
+		t.Fatalf("应越过被截断的最新记录恢复到 %s，得到 %s", r1.ID, rec3.ID)
+	}
+	// 重新打开存档后结果一致。
+	a3, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec4, err := a3.RecoverLatest("s", []string{"v1"})
+	if err != nil {
+		t.Fatalf("重开后恢复结果不一致: %v", err)
+	}
+	if rec4.ID != r1.ID {
+		t.Fatalf("重开后应恢复到 %s，得到 %s", r1.ID, rec4.ID)
 	}
 }
 
@@ -456,9 +473,26 @@ func writeRawRecord(t *testing.T, a *Archive, parent RecordID, first bool, st St
 	return id
 }
 
+// updatePointer 模拟一个遵循磁盘格式的写入器：新记录已完整落盘后原子
+// 更新槽指针，并把新记录按保存次序前置到历史索引。
 func updatePointer(t *testing.T, a *Archive, slot string, id RecordID) {
 	t.Helper()
-	if err := a.replaceSlotPointer(slot, id); err != nil {
+	lock, err := acquireLock(a.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.release()
+	old, err := a.readSlotPointerLocked(slot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	history := []RecordID{id}
+	for _, hid := range old.History {
+		if hid != id {
+			history = append(history, hid)
+		}
+	}
+	if err := a.persistSlotPointerLocked(slot, slotPointer{Latest: id, History: history}); err != nil {
 		t.Fatal(err)
 	}
 }

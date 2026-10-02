@@ -20,8 +20,18 @@ type RecordInfo struct {
 }
 
 // slotPointer 是槽指针文件的磁盘内容，指向该槽当前最新记录。
+//
+// History 按该槽“保存生效的次序”记录全部属于本槽的记录标识，最新在前，
+// 末尾是槽首条记录（直接建立的根记录或分支首记录）。它只在对应记录文件
+// 已完整落盘后才随指针原子更新，因此绝不会包含写了一半的残留文件、写完
+// 但尚未完成保存的孤儿记录，或 CAS 竞争失败的写入。恢复读取据此遍历，
+// 不依赖文件修改时间，也不信任受损记录文件里读出的父标识或槽首标记。
+//
+// 旧版本写出的指针没有 History 字段；读取时会在内存中按校验通过的父链
+// 回退重建，不要求用户转换数据。
 type slotPointer struct {
-	Latest RecordID `json:"latest"`
+	Latest  RecordID   `json:"latest"`
+	History []RecordID `json:"history,omitempty"`
 }
 
 // archiveMarker 是存档目录的标记文件。
@@ -128,21 +138,30 @@ func validSlotName(slot string) bool {
 	return filepath.Clean(slot) == slot
 }
 
-// readLatestLocked 在调用方已持锁的前提下读取槽当前最新记录标识。
-func (a *Archive) readLatestLocked(slot string) (RecordID, error) {
+// readSlotPointerLocked 在调用方已持锁的前提下读取并解析槽指针文件。
+func (a *Archive) readSlotPointerLocked(slot string) (slotPointer, error) {
 	data, err := os.ReadFile(a.slotPath(slot))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return "", &NotFoundError{Slot: slot}
+			return slotPointer{}, &NotFoundError{Slot: slot}
 		}
-		return "", err
+		return slotPointer{}, err
 	}
 	var p slotPointer
 	if err := json.Unmarshal(data, &p); err != nil {
-		return "", &CorruptError{Slot: slot, Reason: "槽指针无法解析"}
+		return slotPointer{}, &CorruptError{Slot: slot, Reason: "槽指针无法解析"}
 	}
 	if p.Latest == "" {
-		return "", &CorruptError{Slot: slot, Reason: "槽指针为空"}
+		return slotPointer{}, &CorruptError{Slot: slot, Reason: "槽指针为空"}
+	}
+	return p, nil
+}
+
+// readLatestLocked 在调用方已持锁的前提下读取槽当前最新记录标识。
+func (a *Archive) readLatestLocked(slot string) (RecordID, error) {
+	p, err := a.readSlotPointerLocked(slot)
+	if err != nil {
+		return "", err
 	}
 	return p.Latest, nil
 }
@@ -192,11 +211,15 @@ func (a *Archive) Save(slot string, w *World) (RecordInfo, error) {
 
 // createSlotPointer 以“临时文件写全 + os.Link 原子建立”的方式创建槽
 // 指针：Link 在目标已存在时失败，因此重名会被明确拒绝，同时崩溃后
-// 要么没有该槽，要么指向一份完整记录，绝不会留下半写的指针。
+// 要么没有该槽，要么指向一份完整记录，绝不会留下半写的指针。新槽的
+// 历史索引只含其首条记录本身——分支槽不会把来源槽的记录计入候选。
 func (a *Archive) createSlotPointer(slot string, id RecordID) error {
 	slotsDir := filepath.Join(a.dir, slotsName)
 	final := a.slotPath(slot)
-	data, _ := json.MarshalIndent(slotPointer{Latest: id}, "", "  ")
+	data, _ := json.MarshalIndent(slotPointer{
+		Latest:  id,
+		History: []RecordID{id},
+	}, "", "  ")
 
 	tmp := filepath.Join(slotsDir, ".new-"+slot+"-"+randomSuffix()+".tmp")
 	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
@@ -248,11 +271,11 @@ func (a *Archive) Replace(slot string, w *World, expected RecordID) (RecordInfo,
 	}
 	defer lock.release()
 
-	latest, err := a.readLatestLocked(slot)
+	pointer, err := a.readSlotPointerLocked(slot)
 	if err != nil {
 		return RecordInfo{}, err
 	}
-	if latest != expected {
+	if pointer.Latest != expected {
 		return RecordInfo{}, &ConflictError{
 			Slot:   slot,
 			Reason: "所依据的记录已不是该槽最新记录",
@@ -273,7 +296,7 @@ func (a *Archive) Replace(slot string, w *World, expected RecordID) (RecordInfo,
 	if err := writeRecord(a.dir, env); err != nil {
 		return RecordInfo{}, err
 	}
-	if err := a.replaceSlotPointer(slot, id); err != nil {
+	if err := a.commitSlotPointerLocked(slot, pointer, expected, id); err != nil {
 		return RecordInfo{}, err
 	}
 	return RecordInfo{
@@ -283,12 +306,23 @@ func (a *Archive) Replace(slot string, w *World, expected RecordID) (RecordInfo,
 	}, nil
 }
 
-func (a *Archive) replaceSlotPointer(slot string, id RecordID) error {
-	data, _ := json.MarshalIndent(slotPointer{Latest: id}, "", "  ")
-	if err := writeAtomic(filepath.Join(a.dir, slotsName), slot+".json", data); err != nil {
+// commitSlotPointerLocked 在记录文件已完整落盘后，原子更新槽指针：指向
+// 新记录，并把历史索引按保存次序前置新记录。历史索引只在此刻（记录已
+// 完整生效）才更新，因此残留临时文件与写完但未完成保存的孤儿记录绝不会
+// 进入恢复候选。
+func (a *Archive) commitSlotPointerLocked(slot string, oldPointer slotPointer, oldLatest, newID RecordID) error {
+	history, err := a.nextSlotHistoryLocked(oldPointer, oldLatest, newID)
+	if err != nil {
 		return err
 	}
-	return nil
+	return a.persistSlotPointerLocked(slot, slotPointer{Latest: newID, History: history})
+}
+
+// replaceSlotPointer 直接把槽指针指向 id，不附带历史索引。它仅用于测试
+// 中模拟旧版本或外部写入器留下的指针；生产写入路径一律走
+// commitSlotPointerLocked 以维护历史索引。
+func (a *Archive) replaceSlotPointer(slot string, id RecordID) error {
+	return a.persistSlotPointerLocked(slot, slotPointer{Latest: id})
 }
 
 // Branch 从 srcSlot 的指定历史记录 src 分出新槽 dstSlot。
@@ -354,14 +388,14 @@ func (a *Archive) Branch(srcSlot string, src RecordID, dstSlot string) (RecordIn
 	}, nil
 }
 
-// assertInSlotHistoryLocked 确认 id 位于 slot 的历史链上（不含越界到
-// 其他槽的父记录）。
+// assertInSlotHistoryLocked 确认 id 位于 slot 自身的历史次序中（分支槽
+// 的历史只含它自己保存成功的记录，不含来源槽记录）。
 func (a *Archive) assertInSlotHistoryLocked(slot string, id RecordID) error {
-	chain, err := a.slotChainLocked(slot)
+	history, err := a.slotHistoryLocked(slot)
 	if err != nil {
 		return err
 	}
-	for _, cid := range chain {
+	for _, cid := range history {
 		if cid == id {
 			return nil
 		}
@@ -369,35 +403,86 @@ func (a *Archive) assertInSlotHistoryLocked(slot string, id RecordID) error {
 	return &NotFoundError{Slot: slot, Record: id}
 }
 
-// slotChainLocked 返回槽的历史记录标识，最新在前，在该槽首条记录处
-// 停止（不跨入分支来源槽）。
-func (a *Archive) slotChainLocked(slot string) ([]RecordID, error) {
-	latest, err := a.readLatestLocked(slot)
+// slotHistoryLocked 返回该槽按保存生效次序排列的记录标识（最新在前、
+// 槽首记录在末尾）。
+//
+// 优先使用指针内嵌的历史索引；旧版本指针没有该索引时，在内存中沿
+// “校验通过”的记录父链回退重建，绝不在读取路径上改写目录。重建在缺失、
+// 无法解析或校验不过的记录处停止——无法确认归属的更老记录不再使用。
+// 槽首标记只取自校验通过的信封，因此受损记录里被篡改的父标识或槽首
+// 标记既不能把遍历引向别的槽，也不能遮住本槽更早的可用记录。
+func (a *Archive) slotHistoryLocked(slot string) ([]RecordID, error) {
+	p, err := a.readSlotPointerLocked(slot)
 	if err != nil {
 		return nil, err
 	}
+	if len(p.History) > 0 {
+		// 以 Latest 为链头做一次去重规范化，容忍索引中的重复项。
+		return dedupeRecordIDs(append([]RecordID{p.Latest}, p.History...)), nil
+	}
+	return a.rebuildHistoryLocked(p.Latest)
+}
+
+// rebuildHistoryLocked 从 latest 起沿校验通过的父链在内存中重建历史，
+// 只返回仍能确认属于本槽的记录；在缺失、无法解析或校验不过的记录处停止。
+func (a *Archive) rebuildHistoryLocked(latest RecordID) ([]RecordID, error) {
 	var chain []RecordID
 	seen := map[RecordID]bool{}
 	cur := latest
 	for cur != "" {
 		if seen[cur] {
-			return nil, &CorruptError{Slot: slot, Record: cur, Reason: "历史链出现环"}
+			return nil, &CorruptError{Record: cur, Reason: "历史链出现环"}
 		}
 		seen[cur] = true
-		env, err := loadRecord(recordPath(a.dir, cur))
+		env, err := a.loadAndVerifyLocked(cur)
 		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				return nil, &CorruptError{Slot: slot, Record: cur, Reason: "历史记录文件缺失"}
-			}
-			return nil, &CorruptError{Slot: slot, Record: cur, Reason: err.Error()}
+			// 缺失、无法解析或校验不过：无法继续确认更老记录的归属，
+			// 旧历史在此断裂；已确认的部分仍可使用。
+			return chain, nil
 		}
 		chain = append(chain, cur)
 		if env.SlotFirst {
-			break
+			return chain, nil
 		}
 		cur = env.Parent
 	}
 	return chain, nil
+}
+
+// dedupeRecordIDs 按首次出现次序去重记录标识。
+func dedupeRecordIDs(ids []RecordID) []RecordID {
+	seen := map[RecordID]bool{}
+	out := ids[:0]
+	for _, id := range ids {
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	return out
+}
+
+// persistSlotPointerLocked 以原子改名写出槽指针。
+func (a *Archive) persistSlotPointerLocked(slot string, p slotPointer) error {
+	data, _ := json.MarshalIndent(p, "", "  ")
+	return writeAtomic(filepath.Join(a.dir, slotsName), slot+".json", data)
+}
+
+// nextSlotHistory 在一次以 oldLatest 为被覆盖/升级记录的成功写入后，
+// 生成新指针应持有的历史次序：新记录在最前，其余沿用此前已确认属于
+// 本槽的记录。旧指针无索引时在内存中回退重建（不完整也照样承接），
+// 从而让旧历史在第一次成功覆盖或升级后获得完整恢复能力。
+func (a *Archive) nextSlotHistoryLocked(oldPointer slotPointer, oldLatest, newID RecordID) ([]RecordID, error) {
+	base := oldPointer.History
+	if len(base) == 0 {
+		rebuilt, err := a.rebuildHistoryLocked(oldLatest)
+		if err != nil {
+			return nil, err
+		}
+		base = rebuilt
+	}
+	return dedupeRecordIDs(append([]RecordID{newID}, base...)), nil
 }
 
 // Slots 返回所有存档槽名。

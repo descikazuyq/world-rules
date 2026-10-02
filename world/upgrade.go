@@ -215,10 +215,11 @@ func (a *Archive) Upgrade(slot string, acceptedVersions []string, target Rules, 
 	}
 	defer lock.release()
 
-	latest, err := a.readLatestLocked(slot)
+	oldPointer, err := a.readSlotPointerLocked(slot)
 	if err != nil {
 		return UpgradeResult{}, err
 	}
+	latest := oldPointer.Latest
 	if latest != expected {
 		return UpgradeResult{}, &ConflictError{
 			Slot:   slot,
@@ -257,7 +258,7 @@ func (a *Archive) Upgrade(slot string, acceptedVersions []string, target Rules, 
 	if err := writeRecord(a.dir, newEnv); err != nil {
 		return UpgradeResult{}, err
 	}
-	if err := a.replaceSlotPointer(slot, id); err != nil {
+	if err := a.commitSlotPointerLocked(slot, oldPointer, latest, id); err != nil {
 		return UpgradeResult{}, err
 	}
 	info := RecordInfo{
