@@ -257,34 +257,23 @@ func (a *Archive) Upgrade(slot string, acceptedVersions []string, target Rules, 
 		}
 	}
 
-	id, err := newRecordID()
-	if err != nil {
-		return UpgradeResult{}, err
-	}
+	// 升级保存目标规则，种子、时间片、角色位置及物品数量和排列原样保留；
+	// 以被升级记录为父，沿用共同的新记录组装、落盘与槽指针提交路径。
 	newState := State{
 		Seed:       env.State.Seed,
 		Rules:      cloneRules(target),
 		Time:       env.State.Time,
 		Characters: cloneCharacters(env.State.Characters),
 	}
-	newEnv := &envelope{
-		Format:    archiveFormatVersion,
-		ID:        id,
-		Parent:    expected,
-		SlotFirst: false,
-		State:     newState,
-	}
-	newEnv.Checksum = computeChecksum(newEnv)
-	if err := writeRecord(a.dir, newEnv); err != nil {
+	info, err := a.appendSlotRecordLocked(slotSave{
+		slot:          slot,
+		oldPointer:    oldPointer,
+		parent:        expected,
+		historyAnchor: latest,
+		state:         newState,
+	})
+	if err != nil {
 		return UpgradeResult{}, err
-	}
-	if err := a.commitSlotPointerLocked(slot, oldPointer, latest, id); err != nil {
-		return UpgradeResult{}, err
-	}
-	info := RecordInfo{
-		ID:      id,
-		Parent:  expected,
-		Version: target.Version,
 	}
 	return UpgradeResult{Check: check, Record: info}, nil
 }

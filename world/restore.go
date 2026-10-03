@@ -147,36 +147,18 @@ func (a *Archive) ConfirmRecovery(slot string, current, source RecordID, accepte
 		}
 	}
 
-	id, err := newRecordID()
-	if err != nil {
-		return RecordInfo{}, err
-	}
-	newEnv := &envelope{
-		Format: archiveFormatVersion,
-		ID:     id,
-		// 新记录以选中的来源为父；来源是槽首记录时也不沿用其槽首标记，
-		// 新记录只是本槽保存次序最前的一条普通记录。
-		Parent:    source,
-		SlotFirst: false,
-		// 种子、完整规则、时间片、角色及物品的内容和排列原样复制，
-		// 允许时间片回到来源时刻。
-		State: cloneState(env.State),
-	}
-	newEnv.Checksum = computeChecksum(newEnv)
-	if err := writeRecord(a.dir, newEnv); err != nil {
-		return RecordInfo{}, err
-	}
-	// 记录完整落盘后才原子更新指针：新记录前置进保存次序，旧历史原样
-	// 保留。崩溃在这一步之前，槽保持确认前的指向与历史，新记录因不在
-	// 历史索引中而不会进入恢复候选。
-	if err := a.commitSlotPointerLocked(slot, oldPointer, oldPointer.Latest, id); err != nil {
-		return RecordInfo{}, err
-	}
-	return RecordInfo{
-		ID:      id,
-		Parent:  source,
-		Version: env.State.Rules.Version,
-	}, nil
+	// 以选中的来源为父（即使来源就是当前记录，仍保存一条独立新记录），
+	// 种子、完整规则、时间片、角色及物品的内容和排列原样复制，允许时间
+	// 片回到来源时刻。历史承接点用槽指针的当前指向：当前记录已损坏或被
+	// 删除时不能去校验它，但来源之后已经生效的本槽历史仍要原样保留，不
+	// 沿来源的父链截断。沿用共同的组装、落盘与槽指针提交路径。
+	return a.appendSlotRecordLocked(slotSave{
+		slot:          slot,
+		oldPointer:    oldPointer,
+		parent:        source,
+		historyAnchor: oldPointer.Latest,
+		state:         cloneState(env.State),
+	})
 }
 
 // assertRecordInOrder 确认 id 出现在按保存生效次序排列的标识序列中。

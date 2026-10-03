@@ -282,28 +282,15 @@ func (a *Archive) Replace(slot string, w *World, expected RecordID) (RecordInfo,
 		}
 	}
 
-	id, err := newRecordID()
-	if err != nil {
-		return RecordInfo{}, err
-	}
-	env := &envelope{
-		Format: archiveFormatVersion,
-		ID:     id,
-		Parent: expected,
-		State:  st,
-	}
-	env.Checksum = computeChecksum(env)
-	if err := writeRecord(a.dir, env); err != nil {
-		return RecordInfo{}, err
-	}
-	if err := a.commitSlotPointerLocked(slot, pointer, expected, id); err != nil {
-		return RecordInfo{}, err
-	}
-	return RecordInfo{
-		ID:      id,
-		Parent:  expected,
-		Version: st.Rules.Version,
-	}, nil
+	// 覆盖保存传入世界的快照，以被覆盖的当前记录为父，沿用共同的
+	// 新记录组装、落盘与槽指针提交路径。
+	return a.appendSlotRecordLocked(slotSave{
+		slot:          slot,
+		oldPointer:    pointer,
+		parent:        expected,
+		historyAnchor: expected,
+		state:         st,
+	})
 }
 
 // commitSlotPointerLocked 在记录文件已完整落盘后，原子更新槽指针：指向
