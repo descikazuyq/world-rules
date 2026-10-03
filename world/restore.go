@@ -147,36 +147,21 @@ func (a *Archive) ConfirmRecovery(slot string, current, source RecordID, accepte
 		}
 	}
 
-	id, err := newRecordID()
-	if err != nil {
-		return RecordInfo{}, err
-	}
-	newEnv := &envelope{
-		Format: archiveFormatVersion,
-		ID:     id,
+	info, err := a.saveSlotRecordLocked(slot, oldPointer, savedRecord{
 		// 新记录以选中的来源为父；来源是槽首记录时也不沿用其槽首标记，
 		// 新记录只是本槽保存次序最前的一条普通记录。
-		Parent:    source,
-		SlotFirst: false,
+		parent: source,
 		// 种子、完整规则、时间片、角色及物品的内容和排列原样复制，
 		// 允许时间片回到来源时刻。
-		State: cloneState(env.State),
-	}
-	newEnv.Checksum = computeChecksum(newEnv)
-	if err := writeRecord(a.dir, newEnv); err != nil {
+		state: cloneState(env.State),
+	})
+	if err != nil {
 		return RecordInfo{}, err
 	}
 	// 记录完整落盘后才原子更新指针：新记录前置进保存次序，旧历史原样
 	// 保留。崩溃在这一步之前，槽保持确认前的指向与历史，新记录因不在
-	// 历史索引中而不会进入恢复候选。
-	if err := a.commitSlotPointerLocked(slot, oldPointer, oldPointer.Latest, id); err != nil {
-		return RecordInfo{}, err
-	}
-	return RecordInfo{
-		ID:      id,
-		Parent:  source,
-		Version: env.State.Rules.Version,
-	}, nil
+	// 历史索引中而不会进入恢复候选（指针提交由共享保存路径完成）。
+	return info, nil
 }
 
 // assertRecordInOrder 确认 id 出现在按保存生效次序排列的标识序列中。

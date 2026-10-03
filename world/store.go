@@ -282,27 +282,59 @@ func (a *Archive) Replace(slot string, w *World, expected RecordID) (RecordInfo,
 		}
 	}
 
+	info, err := a.saveSlotRecordLocked(slot, pointer, savedRecord{
+		parent: expected,
+		state:  st,
+	})
+	if err != nil {
+		return RecordInfo{}, err
+	}
+	return info, nil
+}
+
+// savedRecord 是一次“向已有槽追加一条新记录”的保存输入：父记录标识与
+// 新记录要保存的完整世界状态。各操作特有的前提检查（乐观标识、阻碍、
+// 来源校验等）在调用 saveSlotRecordLocked 之前完成，共同的保存职责集中
+// 在后者中维护。
+type savedRecord struct {
+	parent RecordID
+	state  State
+}
+
+// saveSlotRecordLocked 在调用方已持排他锁、且各操作自身的提交条件均已
+// 通过后，执行普通覆盖、规则升级、显式迁移与确认恢复共享的保存职责：
+//
+// 生成一个独立的新记录标识，组装信封（父记录取入参、追加记录一律不带
+// 槽首标记——即使恢复来源本身带槽首标记也不沿用），计算内容校验和（含
+// 父记录关系），先把记录文件完整落盘，再原子提交槽指针：槽指向新记录，
+// 新记录前置进本槽保存次序，旧历史沿用原保存次序（旧格式裸指针在这一步
+// 获得内嵌历史索引）。记录在指针提交前不会进入恢复候选。返回的标识、
+// 父记录与规则版本与实际落盘内容一致。
+func (a *Archive) saveSlotRecordLocked(slot string, oldPointer slotPointer, rec savedRecord) (RecordInfo, error) {
 	id, err := newRecordID()
 	if err != nil {
 		return RecordInfo{}, err
 	}
 	env := &envelope{
-		Format: archiveFormatVersion,
-		ID:     id,
-		Parent: expected,
-		State:  st,
+		Format:    archiveFormatVersion,
+		ID:        id,
+		Parent:    rec.parent,
+		SlotFirst: false,
+		State:     rec.state,
 	}
 	env.Checksum = computeChecksum(env)
 	if err := writeRecord(a.dir, env); err != nil {
 		return RecordInfo{}, err
 	}
-	if err := a.commitSlotPointerLocked(slot, pointer, expected, id); err != nil {
+	// 提交所依据的当前记录就是旧指针指向的记录（确认恢复时它可能已损坏
+	// 或被删除，仅用于旧格式裸指针的历史重建起点）。
+	if err := a.commitSlotPointerLocked(slot, oldPointer, oldPointer.Latest, id); err != nil {
 		return RecordInfo{}, err
 	}
 	return RecordInfo{
 		ID:      id,
-		Parent:  expected,
-		Version: st.Rules.Version,
+		Parent:  rec.parent,
+		Version: rec.state.Rules.Version,
 	}, nil
 }
 

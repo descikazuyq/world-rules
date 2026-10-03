@@ -307,32 +307,13 @@ func (a *Archive) Migrate(slot string, acceptedVersions []string, target Rules, 
 		}
 	}
 
-	id, err := newRecordID()
+	info, err := a.saveSlotRecordLocked(slot, oldPointer, savedRecord{
+		parent: source,
+		// 保存目标规则与转换后的状态；种子、时间片、角色标识及排列原样。
+		state: preview.State,
+	})
 	if err != nil {
 		return MigrationResult{}, err
-	}
-	newEnv := &envelope{
-		Format:    archiveFormatVersion,
-		ID:        id,
-		Parent:    source,
-		SlotFirst: false,
-		// 保存目标规则与转换后的状态；种子、时间片、角色标识及排列原样。
-		State: preview.State,
-	}
-	newEnv.Checksum = computeChecksum(newEnv)
-	if err := writeRecord(a.dir, newEnv); err != nil {
-		return MigrationResult{}, err
-	}
-	// 记录完整落盘后才原子更新指针：新记录前置进保存次序，旧历史原样
-	// 保留。崩溃在这一步之前，槽保持迁移前的指向与历史，新记录因不在
-	// 历史索引中而不会进入恢复候选。
-	if err := a.commitSlotPointerLocked(slot, oldPointer, source, id); err != nil {
-		return MigrationResult{}, err
-	}
-	info := RecordInfo{
-		ID:      id,
-		Parent:  source,
-		Version: target.Version,
 	}
 	return MigrationResult{Preview: preview, Record: info}, nil
 }
