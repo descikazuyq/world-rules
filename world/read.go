@@ -2,6 +2,7 @@ package world
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"syscall"
 )
@@ -33,6 +34,10 @@ func acquireSharedLock(dir string) (*fileLock, error) {
 
 // loadAndVerifyLocked 读取记录文件，校验其内容校验和（校验和已包含
 // 父记录关系）、父记录是否存在，以及世界数据是否自洽。
+//
+// 对完整世界状态的认可与 WorldFromState 重建世界保持一致：时间片为负的
+// 记录属于损坏记录——内容校验和匹配只说明内容完整，规则版本被接受也不
+// 能使负时间片合法；这样的记录不能被读回，也不能作为恢复或分支的来源。
 func (a *Archive) loadAndVerifyLocked(id RecordID) (*envelope, error) {
 	env, err := loadRecord(recordPath(a.dir, id))
 	if err != nil {
@@ -55,6 +60,11 @@ func (a *Archive) loadAndVerifyLocked(id RecordID) (*envelope, error) {
 			}
 			return nil, err
 		}
+	}
+	// 时间片为负的记录与 WorldFromState 的拒绝保持一致：即使校验和匹配、
+	// 其余状态合法，也按损坏处理，不自动把时间改成零。
+	if env.State.Time < 0 {
+		return nil, &CorruptError{Record: id, Reason: fmt.Sprintf("记录中的时间片为负: %d", env.State.Time)}
 	}
 	if err := validateInitialData(InitialData{
 		Seed:       env.State.Seed,
@@ -88,7 +98,7 @@ func envToRecord(env *envelope) Record {
 //
 // acceptedVersions 是调用方明确给出的可接受规则版本集合：记录完好但
 // 版本不在集合内时返回 *VersionRejectedError；记录损坏（校验和不符、
-// 父记录缺失、无法解析）时返回 *CorruptError。读取不会改写存档。
+// 父记录缺失、无法解析、时间片为负）时返回 *CorruptError。读取不会改写存档。
 func (a *Archive) Latest(slot string, acceptedVersions []string) (Record, error) {
 	if !validSlotName(slot) {
 		return Record{}, &NotFoundError{Slot: slot}
@@ -196,8 +206,8 @@ func (a *Archive) History(slot string) ([]RecordInfo, error) {
 // 遍历次序完全来自槽指针维护的历史索引（最新在前），既不依据文件修改
 // 时间，也不读取受损记录里的父标识或槽首标记：因此最新记录被删除、
 // 截断成无法解析的内容，或连同若干中间记录一起损坏时，仍能越过它们
-// 找到本槽更早的可用记录，而不会被引向别的槽或遮住更早的可用记录。
-// 与世界时间片的大小无关。
+// 找到本槽更早的可用记录，而不会被引向别的槽或遮住更早的可用记录。遍历
+// 次序与世界时间片的大小无关；时间片为负的记录属于损坏记录，同样被越过。
 //
 // 分支槽只在分支自身已成功保存的记录中查找；即使分支首条记录损坏也不
 // 越过分支边界，其他槽即使种子和规则相同也不会替代。版本不被接受的
@@ -238,9 +248,9 @@ func (a *Archive) RecoverLatest(slot string, acceptedVersions []string) (Record,
 // firstRecoverableLocked 在调用方已持锁的前提下，按给定的保存生效次序
 // （最新在前）返回第一份“内容与父关系校验通过且规则版本可接受”的记录。
 //
-// 文件缺失、截断、校验和不符、记录标识不符、父关系异常或世界状态不自洽
-// 的记录一律越过（不读其中的父标识或槽首标记）；版本不被接受的记录也
-// 越过且不自动升级。次序完全由调用方给出（来自槽指针历史索引或沿可信
+// 文件缺失、截断、校验和不符、记录标识不符、父关系异常、时间片为负或世界
+// 状态不自洽的记录一律越过（不读其中的父标识或槽首标记）；版本不被接受的
+// 记录也越过且不自动升级。次序完全由调用方给出（来自槽指针历史索引或沿可信
 // 父链的重建），因此不会被引向别的槽。没有任何可用记录时返回包装了
 // ErrUnrecoverable 的 *UnrecoverableError（Slot 字段由调用方补全）。
 func (a *Archive) firstRecoverableLocked(history []RecordID, acceptedVersions []string) (*envelope, error) {
