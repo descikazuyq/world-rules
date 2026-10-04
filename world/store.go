@@ -3,6 +3,7 @@ package world
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 )
@@ -53,38 +54,96 @@ const (
 
 // Create 在指定目录建立新的存档。目录会被创建；若该目录已经是一个
 // 存档则返回错误，以免覆盖已有数据。
-func Create(dir string) (*Archive, error) {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return nil, err
+//
+// 创建有明确的结果：要么完整成功并返回可立即使用的句柄，要么返回
+// 错误且不返回句柄。准备必要目录、写入存档标记或建立锁文件时出错，
+// 都会把指明失败操作与位置的错误交给调用方，并撤回本次创建已产生的
+// 标记、锁文件与子目录——回退只限本次新增的内容：目录里原有的文件与
+// 子目录（包括原本就存在、可直接使用的空 records/slots 子目录）以及
+// 调用前已存在的目标目录本身都保持原样。因此失败后排除障碍即可用
+// 同一路径重新创建，不会被上一次失败留下的标记拒绝。
+func Create(dir string) (_ *Archive, err error) {
+	// 本次调用新产生的内容，失败时按相反顺序撤回；调用前已存在的
+	// 任何内容都不在撤回范围内。
+	var created []string
+	defer func() {
+		if err != nil {
+			for i := len(created) - 1; i >= 0; i-- {
+				os.Remove(created[i])
+			}
+		}
+	}()
+
+	// 目标目录在调用前已存在时保留它（包括失败回退时）；不存在才
+	// 由本次创建建立，并纳入回退范围。
+	if _, statErr := os.Stat(dir); statErr != nil {
+		if !errors.Is(statErr, os.ErrNotExist) {
+			return nil, fmt.Errorf("检查存档目录 %s: %w", dir, statErr)
+		}
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return nil, fmt.Errorf("建立存档目录 %s: %w", dir, err)
+		}
+		created = append(created, dir)
 	}
+
 	markerPath := filepath.Join(dir, markerName)
 	f, err := os.OpenFile(markerPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		if errors.Is(err, os.ErrExist) {
+			// 已有存档：原样保留既有标记（即使它无法解析），不覆盖，
+			// 也不借回退删除；此时本次尚未产生任何新内容。
 			return nil, &ConflictError{Reason: "目录已是一个存档: " + dir}
 		}
-		return nil, err
+		return nil, fmt.Errorf("写入存档标记 %s: %w", markerPath, err)
 	}
+	created = append(created, markerPath)
 	markerData, _ := json.Marshal(archiveMarker{Format: archiveFormatVersion})
 	if _, err := f.Write(markerData); err != nil {
 		f.Close()
-		return nil, err
+		return nil, fmt.Errorf("写入存档标记 %s: %w", markerPath, err)
 	}
 	if err := f.Close(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("写入存档标记 %s: %w", markerPath, err)
 	}
+
 	for _, sub := range []string{recordsName, slotsName} {
-		if err := os.MkdirAll(filepath.Join(dir, sub), 0o755); err != nil {
-			return nil, err
+		subPath := filepath.Join(dir, sub)
+		if fi, statErr := os.Stat(subPath); statErr == nil {
+			if !fi.IsDir() {
+				return nil, fmt.Errorf("建立存档子目录 %s: 位置已被同名文件占用", subPath)
+			}
+			// 原本就存在的子目录直接沿用，回退时保留。
+			continue
+		} else if !errors.Is(statErr, os.ErrNotExist) {
+			return nil, fmt.Errorf("检查存档子目录 %s: %w", subPath, statErr)
 		}
+		if err := os.Mkdir(subPath, 0o755); err != nil {
+			return nil, fmt.Errorf("建立存档子目录 %s: %w", subPath, err)
+		}
+		created = append(created, subPath)
 	}
-	// 预先建立锁文件并同步目录，使之后的打开更稳妥。
-	if lf, err := os.OpenFile(filepath.Join(dir, "lock"),
-		os.O_RDWR|os.O_CREATE, 0o600); err == nil {
-		lf.Close()
+
+	// 预先建立锁文件并同步目录，使之后的打开更稳妥。锁位置已被占用
+	// （例如已是一个目录）时明确报错，而不是留到首次保存才失败。
+	lockPath := filepath.Join(dir, "lock")
+	_, lockStatErr := os.Stat(lockPath)
+	lockExisted := lockStatErr == nil
+	if lockStatErr != nil && !errors.Is(lockStatErr, os.ErrNotExist) {
+		return nil, fmt.Errorf("检查存档锁文件 %s: %w", lockPath, lockStatErr)
 	}
+	lf, err := os.OpenFile(lockPath, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("建立存档锁文件 %s: %w", lockPath, err)
+	}
+	if err := lf.Close(); err != nil {
+		return nil, fmt.Errorf("建立存档锁文件 %s: %w", lockPath, err)
+	}
+	if !lockExisted {
+		created = append(created, lockPath)
+	}
+
 	if err := syncDir(dir); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("同步存档目录 %s: %w", dir, err)
 	}
 	return &Archive{dir: dir}, nil
 }
