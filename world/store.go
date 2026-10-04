@@ -254,8 +254,27 @@ func (a *Archive) createSlotPointer(slot string, id RecordID) error {
 // Replace 用世界当前状态覆盖槽的最新记录。
 //
 // expected 必须是调用方此前读到的记录标识，并且它仍是该槽最新记录，
-// 写入才会发生；否则返回 *ConflictError。新记录的父记录就是被覆盖的
-// 那次记录。同一目录下并发覆盖同一父记录时只有一个成功。
+// 写入才会发生；expected 为空或已过期时返回 *ConflictError——这一判断只
+// 比较槽指针的当前指向，即使旧标识对应的文件恰好也已损坏或被删除，过期
+// 请求仍报冲突而不是文件错误。槽不存在返回 *NotFoundError。
+//
+// 槽指针仍指向某条记录并不表示它还能作为下一次保存的父记录：标识匹配
+// 后，被覆盖的当前记录还必须本身完整、内容校验和匹配（含父记录关系）、
+// 世界状态合法（时间片不为负且初始数据自洽），并且它引用的父记录仍存在。
+// 当前记录文件不存在时返回 *NotFoundError；被截断、校验和不匹配、世界
+// 状态不合法或父记录缺失时返回 *CorruptError（错误保留槽名与记录标识）。
+// 不能用调用方带来的完整世界掩盖当前记录的问题，也不自动挑选一条更老
+// 记录替它成为父记录。
+//
+// 因上述校验拒绝覆盖时不写出任何新记录：槽仍指向原标识，历史与已有记录
+// 文件保持原样，调用方传入的世界也不被修改。当前记录完好且标识匹配时，
+// 新记录以被覆盖的当前记录为父，保存传入世界的快照，并按保存次序前置进
+// 历史。普通覆盖不要求调用方提供可接受规则版本集合，不替换世界中的规则，
+// 也不把被覆盖记录的状态当成本次要保存的状态。同一目录下并发覆盖同一
+// 父记录时只有一个成功。
+//
+// 注意这与确认恢复的公开区别：确认恢复只比较当前标识，当前记录已损坏或
+// 被删除仍可从本槽合法的历史来源恢复；普通覆盖则要求当前记录本身可读。
 func (a *Archive) Replace(slot string, w *World, expected RecordID) (RecordInfo, error) {
 	if !validSlotName(slot) {
 		return RecordInfo{}, &ConflictError{Slot: slot, Reason: "非法存档槽名"}
@@ -275,11 +294,24 @@ func (a *Archive) Replace(slot string, w *World, expected RecordID) (RecordInfo,
 	if err != nil {
 		return RecordInfo{}, err
 	}
+	// 乐观并发控制只比较标识：旧标识过期一律冲突，即使它指向的文件恰好
+	// 也已损坏或被删除，也不能把过期请求改报成文件错误。
 	if pointer.Latest != expected {
 		return RecordInfo{}, &ConflictError{
 			Slot:   slot,
 			Reason: "所依据的记录已不是该槽最新记录",
 		}
+	}
+
+	// 被覆盖的当前记录必须本身可正常读取：文件存在、内容校验和匹配（含
+	// 父记录关系）、世界状态合法且引用的父记录仍在。它将成为新记录的父
+	// 记录，缺失或受损时不能承担该角色——不用传入世界掩盖问题，也不改选
+	// 更老记录。校验在任何写入之前，拒绝时不留下新记录、不移动槽指针。
+	if _, err := a.loadAndVerifyLocked(expected); err != nil {
+		if ce, ok := err.(*CorruptError); ok {
+			ce.Slot = slot
+		}
+		return RecordInfo{}, err
 	}
 
 	// 覆盖保存传入世界的快照，以被覆盖的当前记录为父，沿用共同的

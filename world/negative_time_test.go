@@ -207,7 +207,8 @@ func TestConfirmRecoveryNegativeTimeSourceRejected(t *testing.T) {
 	neg := forgeNegativeTimeLatest(t, a, "s", -4)
 
 	// 在负时间片记录之上再保存一条合法记录作为当前记录，使负时间片记录
-	// 成为本槽历史中的中间记录。
+	// 成为本槽历史中的中间记录。当前记录损坏时普通覆盖会被拒绝，因此这里
+	// 直接按正常保存次序提交这条合法记录，而不是经由 Replace。
 	rec, err := a.Record("s", ids[0], []string{"v1"})
 	if err != nil {
 		t.Fatal(err)
@@ -219,10 +220,9 @@ func TestConfirmRecoveryNegativeTimeSourceRejected(t *testing.T) {
 	if _, err := w.Apply(Commit{Time: 5}); err != nil {
 		t.Fatal(err)
 	}
-	cur, err := a.Replace("s", w, neg)
-	if err != nil {
-		t.Fatal(err)
-	}
+	curID := writeRawRecord(t, a, neg, false, w.Snapshot())
+	updatePointer(t, a, "s", curID)
+	cur := RecordInfo{ID: curID, Parent: neg, Version: "v1"}
 	before := recordCount(t, a)
 
 	_, err = a.ConfirmRecovery("s", cur.ID, neg, []string{"v1"})
