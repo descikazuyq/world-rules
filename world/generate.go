@@ -182,18 +182,29 @@ func generateMap(seed int64, locations []string, required, banned []Edge, roadCo
 		pool[i], pool[j] = pool[j], pool[i]
 	}
 
-	// 先沿洗牌次序连通全图，连通后继续按次序补足目标数量。
+	// 沿洗牌次序选路：尚未连通时只取能合并分量的道路；连通后依次
+	// 补足目标数量。名额必须用满，因此当剩余名额等于剩余候选道路数时，
+	// 后续每条道路都必须选入——否则即使连通，名额也无法补齐。前面的
+	// 可行性检查已保证：全部候选道路能连通全图，且目标数不少于连通
+	// 所需数，所以这里按"取满"约束选出的地图最终必然连通，且不会
+	// 因为种子的洗牌次序把本可满足的请求误判为无解。
 	chosen := make([]Edge, 0, roadCount)
 	for e := range reqSet {
 		chosen = append(chosen, e)
 	}
-	for _, e := range pool {
+	for i, e := range pool {
 		if len(chosen) == roadCount {
 			break
 		}
 		if components > 1 {
-			if uf.union(index[e.From], index[e.To]) {
-				components--
+			merged := uf.union(index[e.From], index[e.To])
+			// 剩余名额已不少于剩余候选道路数：此边不取则名额无法用满，
+			// 即使它暂时成环也必须选入（可行性检查保证取满后必然连通）。
+			mustTake := roadCount-len(chosen) >= len(pool)-i
+			if merged || mustTake {
+				if merged {
+					components--
+				}
 				chosen = append(chosen, e)
 			}
 		} else {

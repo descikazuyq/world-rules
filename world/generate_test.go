@@ -3,6 +3,7 @@ package world
 import (
 	"math"
 	"reflect"
+	"sort"
 	"testing"
 )
 
@@ -321,6 +322,278 @@ func TestGenerateEverySeedSucceedsWhenSolvable(t *testing.T) {
 			t.Fatalf("种子 %d 生成失败: %v", seed, err)
 		}
 		assertMapShape(t, st.Snapshot(), req)
+	}
+}
+
+// TestGenerateDenseTargets 是本缺陷的核心回归：目标道路数接近或等于
+// 可用道路总数时，地图往往只有唯一解，种子只应决定"选出哪张合法地图"，
+// 不能决定请求成败。
+func TestGenerateDenseTargets(t *testing.T) {
+	allEdges := func(locs ...string) []Edge {
+		var out []Edge
+		for i := 0; i < len(locs); i++ {
+			for j := i + 1; j < len(locs); j++ {
+				out = append(out, Edge{From: locs[i], To: locs[j]})
+			}
+		}
+		return out
+	}
+
+	cases := []struct {
+		name      string
+		locs      []string
+		required  []Edge
+		banned    []Edge
+		roadCount int
+		want      []Edge
+	}{
+		{
+			name:      "四地点六条无约束=全部边",
+			locs:      []string{"a", "b", "c", "d"},
+			roadCount: 6,
+			want:      allEdges("a", "b", "c", "d"),
+		},
+		{
+			name:      "四地点禁用一条目标五=恰好其余五条",
+			locs:      []string{"a", "b", "c", "d"},
+			banned:    []Edge{{From: "c", To: "d"}},
+			roadCount: 5,
+			want: []Edge{
+				{From: "a", To: "b"}, {From: "a", To: "c"}, {From: "a", To: "d"},
+				{From: "b", To: "c"}, {From: "b", To: "d"},
+			},
+		},
+		{
+			name:      "五地点十条=完全图",
+			locs:      []string{"a", "b", "c", "d", "e"},
+			roadCount: 10,
+			want:      allEdges("a", "b", "c", "d", "e"),
+		},
+		{
+			name:      "五地点禁用一条目标九=恰好其余九条",
+			locs:      []string{"a", "b", "c", "d", "e"},
+			banned:    []Edge{{From: "a", To: "b"}},
+			roadCount: 9,
+			want: func() []Edge {
+				es := allEdges("a", "b", "c", "d", "e")
+				out := es[:0]
+				for _, e := range es {
+					if e != (Edge{From: "a", To: "b"}) {
+						out = append(out, e)
+					}
+				}
+				return out
+			}(),
+		},
+		{
+			name: "必有三边成环加第四点，目标四",
+			locs: []string{"a", "b", "c", "d"},
+			required: []Edge{
+				{From: "a", To: "b"}, {From: "b", To: "c"}, {From: "c", To: "a"},
+			},
+			roadCount: 4,
+			// 有三张合法地图（由 a/b/c 之一连接 d），种子决定选哪张，
+			// 因此只校验形状与必有道路，不断言具体是哪一张。
+		},
+	}
+
+	seeds := []int64{0, 1, -1, 2, 3, 5, 7, 42, -42, math.MaxInt64, math.MinInt64}
+	for _, tc := range cases {
+		for _, seed := range seeds {
+			req := GenerateRequest{
+				Seed:         seed,
+				Locations:    tc.locs,
+				Required:     tc.required,
+				Banned:       tc.banned,
+				RoadCount:    tc.roadCount,
+				RulesVersion: "v1",
+			}
+			w, err := GenerateWorld(req)
+			if err != nil {
+				t.Fatalf("%s: 种子 %d 本应成功却失败: %v", tc.name, seed, err)
+			}
+			got := w.Snapshot().Rules.Edges
+			if tc.want != nil && !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("%s: 种子 %d 地图不符:\n got %v\nwant %v", tc.name, seed, got, tc.want)
+			}
+			assertMapShape(t, w.Snapshot(), req)
+		}
+	}
+}
+
+// independentFeasible 用与生成算法无关的方式判定约束是否有解：
+// 包含全部必有道路、避开全部禁用道路、全图连通且恰有 rc 条不同道路。
+func independentFeasible(t *testing.T, locs []string, required, banned []Edge, rc int) bool {
+	t.Helper()
+	n := len(locs)
+	sorted := append([]string(nil), locs...)
+	sort.Strings(sorted)
+	idx := make(map[string]int, n)
+	for i, l := range sorted {
+		idx[l] = i
+	}
+	norm := func(es []Edge) map[Edge]struct{} {
+		m := make(map[Edge]struct{}, len(es))
+		for _, e := range es {
+			if e.To < e.From {
+				e = Edge{From: e.To, To: e.From}
+			}
+			m[e] = struct{}{}
+		}
+		return m
+	}
+	reqSet, banSet := norm(required), norm(banned)
+	for e := range reqSet {
+		if _, bad := banSet[e]; bad {
+			return false
+		}
+	}
+	if rc < 0 || rc < len(reqSet) {
+		return false
+	}
+	var avail []Edge
+	for i := 0; i < n; i++ {
+		for j := i + 1; j < n; j++ {
+			e := Edge{From: sorted[i], To: sorted[j]}
+			if _, bad := banSet[e]; !bad {
+				avail = append(avail, e)
+			}
+		}
+	}
+	if rc > len(avail) {
+		return false
+	}
+	uf := newUnionFind(n)
+	comp := n
+	for e := range reqSet {
+		if uf.union(idx[e.From], idx[e.To]) {
+			comp--
+		}
+	}
+	if rc < len(reqSet)+comp-1 {
+		return false
+	}
+	full := newUnionFind(n)
+	c := n
+	for _, e := range avail {
+		if full.union(idx[e.From], idx[e.To]) {
+			c--
+		}
+	}
+	return c == 1
+}
+
+// TestGenerateFeasibilityAcrossSeeds 在多种 n、目标数、必有/禁用组合下
+// 用独立判定器交叉验证：有解则每个种子都必须成功且地图合法，无解则必须
+// 返回错误，不能返回连通但道路数不足的世界。
+func TestGenerateFeasibilityAcrossSeeds(t *testing.T) {
+	configs := []struct {
+		locs     []string
+		required []Edge
+		banned   []Edge
+	}{
+		{[]string{"a", "b", "c"}, nil, nil},
+		{[]string{"a", "b", "c", "d"}, nil, []Edge{{From: "a", To: "b"}}},
+		{[]string{"a", "b", "c", "d"},
+			[]Edge{{From: "a", To: "b"}},
+			[]Edge{{From: "c", To: "d"}}},
+		{[]string{"a", "b", "c", "d"},
+			[]Edge{{From: "a", To: "b"}, {From: "b", To: "c"}, {From: "c", To: "a"}}, nil},
+		{[]string{"a", "b", "c", "d", "e"},
+			[]Edge{{From: "a", To: "b"}, {From: "a", To: "c"}, {From: "b", To: "c"}},
+			[]Edge{{From: "d", To: "e"}}},
+		{[]string{"a", "b", "c", "d", "e"},
+			[]Edge{{From: "a", To: "b"}},
+			[]Edge{{From: "a", To: "c"}, {From: "a", To: "d"}, {From: "a", To: "e"}}},
+	}
+	for ci, cfg := range configs {
+		n := len(cfg.locs)
+		maxRoads := n * (n - 1) / 2
+		for rc := 0; rc <= maxRoads; rc++ {
+			feasible := independentFeasible(t, cfg.locs, cfg.required, cfg.banned, rc)
+			for _, seed := range []int64{-7, -1, 0, 1, 42, 999} {
+				req := GenerateRequest{
+					Seed:         seed,
+					Locations:    cfg.locs,
+					Required:     cfg.required,
+					Banned:       cfg.banned,
+					RoadCount:    rc,
+					RulesVersion: "v1",
+				}
+				w, err := GenerateWorld(req)
+				if feasible {
+					if err != nil {
+						t.Fatalf("配置%d rc=%d 种子%d 有解却失败: %v", ci, rc, seed, err)
+					}
+					assertMapShape(t, w.Snapshot(), req)
+					if got := len(w.Snapshot().Rules.Edges); got != rc {
+						t.Fatalf("配置%d rc=%d 返回道路数不足: %d", ci, rc, got)
+					}
+				} else if err == nil {
+					t.Fatalf("配置%d rc=%d 无解却成功: %v", ci, rc, w.Snapshot().Rules.Edges)
+				}
+			}
+		}
+	}
+}
+
+// TestGeneratePreviouslySuccessfulMapsLocked 锁定修复前已经成功的请求
+// 的精确地图内容与排列：修复失败请求不得改变这些种子的地图。
+func TestGeneratePreviouslySuccessfulMapsLocked(t *testing.T) {
+	cases := []struct {
+		name string
+		req  GenerateRequest
+		want []Edge
+	}{
+		{
+			name: "基础配置 seed=42",
+			req: func() GenerateRequest {
+				r := baseGenerateRequest()
+				return r
+			}(),
+			want: []Edge{
+				{From: "cave", To: "hall"},
+				{From: "dock", To: "hall"},
+				{From: "dock", To: "yard"},
+				{From: "hall", To: "yard"},
+			},
+		},
+		{
+			name: "基础配置 seed=0",
+			req: func() GenerateRequest {
+				r := baseGenerateRequest()
+				r.Seed = 0
+				return r
+			}(),
+			want: []Edge{
+				{From: "cave", To: "hall"},
+				{From: "cave", To: "yard"},
+				{From: "dock", To: "hall"},
+				{From: "hall", To: "yard"},
+			},
+		},
+		{
+			name: "必有三边成环 seed=0",
+			req: GenerateRequest{
+				Seed:         0,
+				Locations:    []string{"a", "b", "c", "d"},
+				Required:     []Edge{{From: "a", To: "b"}, {From: "b", To: "c"}, {From: "c", To: "a"}},
+				RoadCount:    4,
+				RulesVersion: "v1",
+			},
+			want: []Edge{
+				{From: "a", To: "b"},
+				{From: "a", To: "c"},
+				{From: "b", To: "c"},
+				{From: "c", To: "d"},
+			},
+		},
+	}
+	for _, tc := range cases {
+		st := generateWorld(t, tc.req).Snapshot()
+		if !reflect.DeepEqual(st.Rules.Edges, tc.want) {
+			t.Fatalf("%s 地图被改变:\n got %v\nwant %v", tc.name, st.Rules.Edges, tc.want)
+		}
 	}
 }
 
