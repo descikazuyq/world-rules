@@ -3,6 +3,7 @@ package world
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"syscall"
 )
 
@@ -13,7 +14,7 @@ type fileLock struct {
 }
 
 func acquireLock(dir string) (*fileLock, error) {
-	path := dir + "/lock"
+	path := filepath.Join(dir, lockName)
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("无法打开存档锁: %w", err)

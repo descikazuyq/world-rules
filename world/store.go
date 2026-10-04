@@ -3,6 +3,7 @@ package world
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 )
@@ -49,44 +50,206 @@ const (
 	markerName  = "archive.json"
 	recordsName = "records"
 	slotsName   = "slots"
+	lockName    = "lock"
 )
 
-// Create 在指定目录建立新的存档。目录会被创建；若该目录已经是一个
-// 存档则返回错误，以免覆盖已有数据。
-func Create(dir string) (*Archive, error) {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+// Create 在指定目录建立新的存档。成功返回可立即读写的存档句柄；任一
+// 准备阶段失败都返回错误且不返回句柄。
+//
+// 准备工作依次为：建立目标目录、写入存档标记、准备 records/slots
+// 子目录、建立后续读写所需的锁文件。任一步骤出错（例如 records 或
+// slots 的位置被同名普通文件占用，或锁文件的位置是一个目录）都会明确
+// 报错并指出失败的操作或位置，绝不会忽略错误后照常返回句柄。
+//
+// 失败时本次 Create 新增的内容——新建的存档标记、锁文件、必要子目录
+// 以及由本次调用新建的目标目录本身——都会被撤回，因此用户排除障碍后
+// 可用同一路径重新创建，无需手工清理上一次失败的残留。回退只删除本次
+// 调用新增的路径：调用前就已存在的目标目录、其中原有的文件和子目录（含
+// 可供存档使用的空子目录）一律保留且内容不变。
+//
+// 若调用前存档标记已经存在，按已有存档处理，直接返回冲突错误：不覆盖
+// 标记、不尝试修补或重建目录，也不解析标记内容——即使标记无法解析也
+// 只报冲突，绝不借失败回退删除它。
+func Create(dir string) (a *Archive, err error) {
+	// created 记录本调用实际新建的路径，用于失败时精确回退：只有记录
+	// 在案的路径才会被删除，调用前就已存在的目录与文件绝不动。
+	var created []string
+	rollback := func() {
+		for i := len(created) - 1; i >= 0; i-- {
+			_ = os.Remove(created[i])
+		}
+	}
+	defer func() {
+		if err != nil {
+			rollback()
+		}
+	}()
+
+	if err = prepareDir(dir, &created); err != nil {
 		return nil, err
 	}
+	if err = prepareMarker(dir, &created); err != nil {
+		return nil, err
+	}
+	if err = prepareSubdir(dir, recordsName, &created); err != nil {
+		return nil, err
+	}
+	if err = prepareSubdir(dir, slotsName, &created); err != nil {
+		return nil, err
+	}
+	if err = prepareLock(dir, &created); err != nil {
+		return nil, err
+	}
+	if err = syncDir(dir); err != nil {
+		err = fmt.Errorf("world: 同步存档目录 %q 失败: %w", dir, err)
+		return nil, err
+	}
+	return &Archive{dir: dir}, nil
+}
+
+// prepareDir 确保目标目录存在（必要时连同父目录一起建立，与原先的
+// MkdirAll 行为一致）。只有本调用的 mkdir 实际新建的目录才登记到
+// created，以便失败时精确回退；调用前已存在的目录绝不登记、绝不删除。
+func prepareDir(dir string, created *[]string) error {
+	if err := mkdirAllTracked(dir, created); err != nil {
+		return fmt.Errorf("world: 建立存档目录 %q 失败: %w", dir, err)
+	}
+	return nil
+}
+
+// mkdirAllTracked 的行为与 os.MkdirAll 相同，但每成功新建一个目录就把
+// 它登记到 created。登记只发生在本调用的 mkdir 成功之后，因此并发创建
+// 同一目录树时，每个进程都只会回退自己真正新建的路径。
+func mkdirAllTracked(path string, created *[]string) error {
+	switch err := os.Mkdir(path, 0o755); {
+	case err == nil:
+		*created = append(*created, path)
+		return nil
+	case errors.Is(err, os.ErrExist):
+		return requireDir(path, "存档目录")
+	case errors.Is(err, os.ErrNotExist):
+		parent := filepath.Dir(path)
+		if parent != path {
+			if err := mkdirAllTracked(parent, created); err != nil {
+				return err
+			}
+		}
+		switch err := os.Mkdir(path, 0o755); {
+		case err == nil:
+			*created = append(*created, path)
+			return nil
+		case errors.Is(err, os.ErrExist):
+			return requireDir(path, "存档目录")
+		default:
+			return err
+		}
+	default:
+		return err
+	}
+}
+
+// requireDir 确认 path 存在且是目录，否则返回指出位置的错误。
+func requireDir(path, what string) error {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("world: 检查%s %q 失败: %w", what, path, err)
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf("world: %s位置 %q 已存在且不是目录", what, path)
+	}
+	return nil
+}
+
+// prepareMarker 写入存档标记。调用前标记已存在时按已有存档处理——不
+// 解析内容，统一返回 *ConflictError，且该路径不在回退范围内。
+func prepareMarker(dir string, created *[]string) error {
 	markerPath := filepath.Join(dir, markerName)
 	f, err := os.OpenFile(markerPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		if errors.Is(err, os.ErrExist) {
-			return nil, &ConflictError{Reason: "目录已是一个存档: " + dir}
+			return &ConflictError{Reason: "目录已是一个存档: " + dir}
 		}
-		return nil, err
+		return fmt.Errorf("world: 建立存档标记 %q 失败: %w", markerPath, err)
 	}
+	*created = append(*created, markerPath)
 	markerData, _ := json.Marshal(archiveMarker{Format: archiveFormatVersion})
 	if _, err := f.Write(markerData); err != nil {
 		f.Close()
-		return nil, err
+		return fmt.Errorf("world: 写入存档标记 %q 失败: %w", markerPath, err)
 	}
 	if err := f.Close(); err != nil {
-		return nil, err
+		return fmt.Errorf("world: 关闭存档标记 %q 失败: %w", markerPath, err)
 	}
-	for _, sub := range []string{recordsName, slotsName} {
-		if err := os.MkdirAll(filepath.Join(dir, sub), 0o755); err != nil {
-			return nil, err
+	return nil
+}
+
+// prepareSubdir 确保存档所需的子目录存在且确实是目录。位置被同名普通
+// 文件占用时明确拒绝；若子目录由本调用新建则登记回退。调用前就存在的
+// 空子目录（可供存档使用）予以保留，不登记、不删除。
+func prepareSubdir(dir, name string, created *[]string) error {
+	path := filepath.Join(dir, name)
+	switch err := os.Mkdir(path, 0o755); {
+	case err == nil:
+		*created = append(*created, path)
+		return nil
+	case errors.Is(err, os.ErrExist):
+		fi, statErr := os.Stat(path)
+		if statErr != nil {
+			return fmt.Errorf("world: 检查存档子目录 %q 失败: %w", path, statErr)
 		}
+		if !fi.IsDir() {
+			return fmt.Errorf("world: 存档所需位置 %q 已被同名普通文件占用", path)
+		}
+		// 已存在的空（或非空）目录：保留原样，不属于本次新增内容。
+		return nil
+	default:
+		return fmt.Errorf("world: 建立存档子目录 %q 失败: %w", path, err)
 	}
-	// 预先建立锁文件并同步目录，使之后的打开更稳妥。
-	if lf, err := os.OpenFile(filepath.Join(dir, "lock"),
-		os.O_RDWR|os.O_CREATE, 0o600); err == nil {
-		lf.Close()
+}
+
+// prepareLock 确保后续读写所需的锁文件位置可用：位置不存在时以 O_EXCL
+// 新建并登记回退；已是一个目录或其他不可作为普通文件读写的对象时，明确
+// 拒绝创建并指出位置。位置上原本就存在一个可读写的普通文件时，它本就
+// 能充当锁文件（与历史行为一致），直接采用且不登记——失败回退不会删除
+// 这份用户原有内容。
+func prepareLock(dir string, created *[]string) error {
+	path := filepath.Join(dir, lockName)
+	fi, err := os.Stat(path)
+	switch {
+	case err == nil:
+		switch {
+		case fi.IsDir():
+			return fmt.Errorf("world: 锁文件位置 %q 已是一个目录，无法建立锁文件", path)
+		case !fi.Mode().IsRegular():
+			return fmt.Errorf("world: 锁文件位置 %q 被非普通文件占用，无法建立锁文件", path)
+		}
+		// 已有普通文件：确认可读写即可采用，不截断、不改写内容。
+		f, openErr := os.OpenFile(path, os.O_RDWR, 0o600)
+		if openErr != nil {
+			return fmt.Errorf("world: 使用已有锁文件 %q 失败: %w", path, openErr)
+		}
+		if err := f.Close(); err != nil {
+			return fmt.Errorf("world: 关闭锁文件 %q 失败: %w", path, err)
+		}
+		return nil
+	case errors.Is(err, os.ErrNotExist):
+		f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+		if err != nil {
+			if errors.Is(err, os.ErrExist) {
+				// 与上面的 Stat 之间被并发抢先建立：按已存在处理，
+				// 交回给开头的分支判断。
+				return prepareLock(dir, created)
+			}
+			return fmt.Errorf("world: 建立锁文件 %q 失败: %w", path, err)
+		}
+		*created = append(*created, path)
+		if err := f.Close(); err != nil {
+			return fmt.Errorf("world: 关闭锁文件 %q 失败: %w", path, err)
+		}
+		return nil
+	default:
+		return fmt.Errorf("world: 检查锁文件位置 %q 失败: %w", path, err)
 	}
-	if err := syncDir(dir); err != nil {
-		return nil, err
-	}
-	return &Archive{dir: dir}, nil
 }
 
 // Open 打开一个此前由 Create 建立的存档目录。
