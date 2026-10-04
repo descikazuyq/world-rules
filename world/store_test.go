@@ -92,6 +92,130 @@ func TestReplaceRequiresExpectedAndCAS(t *testing.T) {
 	}
 }
 
+// TestReplaceCurrentRecordMissing 普通覆盖所依据的当前记录文件已被删除时，
+// 返回记录不存在错误：槽指向、历史与已有记录保持原样，不产生新记录，传入
+// 的世界不被改动；随后仍可通过恢复预览与确认恢复从完好的历史记录恢复。
+func TestReplaceCurrentRecordMissing(t *testing.T) {
+	a, dir := newTestArchive(t)
+	ids := saveN(t, a, "s", 1) // r1(time 1) r0(time 0)
+	if err := os.Remove(recordPath(dir, ids[0])); err != nil {
+		t.Fatal(err)
+	}
+
+	w := baseWorld(t)
+	if _, err := w.Apply(Commit{Time: 7}); err != nil {
+		t.Fatal(err)
+	}
+	before := recordCount(t, a)
+	_, err := a.Replace("s", w, ids[0])
+	var nfe *NotFoundError
+	if !errors.As(err, &nfe) {
+		t.Fatalf("当前记录缺失应返回 NotFoundError，得到 %T: %v", err, err)
+	}
+	if nfe.Record != ids[0] {
+		t.Fatalf("错误应指出缺失的记录 %s，得到 %+v", ids[0], nfe)
+	}
+
+	// 槽仍指向原标识，历史与记录文件不变，传入的世界保持原状态。
+	p, err := a.readSlotPointerLocked("s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Latest != ids[0] {
+		t.Fatalf("槽指向不应改变: %s -> %s", ids[0], p.Latest)
+	}
+	if got := recordCount(t, a); got != before {
+		t.Fatalf("被拒绝的覆盖不应产生新记录: %d -> %d", before, got)
+	}
+	if got := w.Snapshot().Time; got != 7 {
+		t.Fatalf("传入的世界不应被改动: 时间片 %d", got)
+	}
+
+	// 随后通过恢复预览选择完好的历史记录，仍可确认恢复。
+	preview, err := a.PreviewRecovery("s", []string{"v1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preview.Current != ids[0] || preview.Source != ids[1] {
+		t.Fatalf("预览应选中完好的历史记录: %+v", preview)
+	}
+	if _, err := a.ConfirmRecovery("s", preview.Current, preview.Source, []string{"v1"}); err != nil {
+		t.Fatalf("确认恢复: %v", err)
+	}
+}
+
+// TestReplaceCurrentRecordCorrupt 当前记录标识仍匹配但记录本身损坏（截断、
+// 校验和不匹配、时间片为负、父记录缺失）时，普通覆盖返回指出受影响槽与
+// 记录的损坏错误：不用传入的完整世界掩盖问题，不改选较老记录为父，槽
+// 指向、历史与已有记录保持原样。
+func TestReplaceCurrentRecordCorrupt(t *testing.T) {
+	cases := []struct {
+		name    string
+		corrupt func(t *testing.T, a *Archive, dir string, ids []RecordID)
+	}{
+		{"截断", func(t *testing.T, a *Archive, dir string, ids []RecordID) {
+			truncateRecord(t, dir, ids[0])
+		}},
+		{"校验和不匹配", func(t *testing.T, a *Archive, dir string, ids []RecordID) {
+			corruptChecksum(t, dir, ids[0])
+		}},
+		{"时间片为负", func(t *testing.T, a *Archive, dir string, ids []RecordID) {
+			rewriteRecordTime(t, a, ids[0], -1)
+		}},
+		{"父记录缺失", func(t *testing.T, a *Archive, dir string, ids []RecordID) {
+			if err := os.Remove(recordPath(dir, ids[1])); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a, dir := newTestArchive(t)
+			ids := saveN(t, a, "s", 1)
+			tc.corrupt(t, a, dir, ids)
+
+			w := baseWorld(t)
+			before := recordCount(t, a)
+			_, err := a.Replace("s", w, ids[0])
+			var ce *CorruptError
+			if !errors.As(err, &ce) {
+				t.Fatalf("当前记录损坏应返回 CorruptError，得到 %T: %v", err, err)
+			}
+			if ce.Record != ids[0] || ce.Slot != "s" {
+				t.Fatalf("错误应指出受影响的槽与记录: %+v", ce)
+			}
+
+			p, err := a.readSlotPointerLocked("s")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if p.Latest != ids[0] {
+				t.Fatalf("槽指向不应改变: %s -> %s", ids[0], p.Latest)
+			}
+			if got := recordCount(t, a); got != before {
+				t.Fatalf("被拒绝的覆盖不应产生新记录: %d -> %d", before, got)
+			}
+		})
+	}
+}
+
+// TestReplaceStaleExpectedStillConflict 预期标识已过期时仍返回冲突：即使该
+// 标识对应的旧文件恰好已被删除，也不能把这次过期请求改报为文件错误。
+func TestReplaceStaleExpectedStillConflict(t *testing.T) {
+	a, dir := newTestArchive(t)
+	ids := saveN(t, a, "s", 1) // r1(time 1) r0(time 0)
+	if err := os.Remove(recordPath(dir, ids[1])); err != nil {
+		t.Fatal(err)
+	}
+
+	w := baseWorld(t)
+	_, err := a.Replace("s", w, ids[1])
+	var ce *ConflictError
+	if !errors.As(err, &ce) {
+		t.Fatalf("过期标识应返回 ConflictError，得到 %T: %v", err, err)
+	}
+}
+
 func TestOverwrittenHistoryStillReadable(t *testing.T) {
 	a, dir := newTestArchive(t)
 	w := baseWorld(t)

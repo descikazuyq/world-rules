@@ -204,10 +204,10 @@ func TestBranchNegativeTimeSourceRejected(t *testing.T) {
 func TestConfirmRecoveryNegativeTimeSourceRejected(t *testing.T) {
 	a, _ := newTestArchive(t)
 	ids := saveN(t, a, "s", 1) // r1(time 1) r0(time 0)
-	neg := forgeNegativeTimeLatest(t, a, "s", -4)
 
-	// 在负时间片记录之上再保存一条合法记录作为当前记录，使负时间片记录
-	// 成为本槽历史中的中间记录。
+	// 先在合法记录之上正常覆盖一条合法记录作为当前记录，再把历史中间的
+	// 记录改写成负时间片，使它成为本槽历史中的损坏中间记录（普通覆盖
+	// 本身会拒绝以损坏记录为父，不能直接用它来构造这一场景）。
 	rec, err := a.Record("s", ids[0], []string{"v1"})
 	if err != nil {
 		t.Fatal(err)
@@ -219,10 +219,12 @@ func TestConfirmRecoveryNegativeTimeSourceRejected(t *testing.T) {
 	if _, err := w.Apply(Commit{Time: 5}); err != nil {
 		t.Fatal(err)
 	}
-	cur, err := a.Replace("s", w, neg)
+	cur, err := a.Replace("s", w, ids[0])
 	if err != nil {
 		t.Fatal(err)
 	}
+	neg := ids[0]
+	rewriteRecordTime(t, a, neg, -4)
 	before := recordCount(t, a)
 
 	_, err = a.ConfirmRecovery("s", cur.ID, neg, []string{"v1"})
@@ -238,7 +240,7 @@ func TestConfirmRecoveryNegativeTimeSourceRejected(t *testing.T) {
 	if p.Latest != cur.ID {
 		t.Fatalf("槽指向不应改变: %s -> %s", cur.ID, p.Latest)
 	}
-	wantHist := []RecordID{cur.ID, neg, ids[0], ids[1]}
+	wantHist := []RecordID{cur.ID, neg, ids[1]}
 	if len(p.History) != len(wantHist) {
 		t.Fatalf("历史不应改变: %v", p.History)
 	}

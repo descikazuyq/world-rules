@@ -254,8 +254,13 @@ func (a *Archive) createSlotPointer(slot string, id RecordID) error {
 // Replace 用世界当前状态覆盖槽的最新记录。
 //
 // expected 必须是调用方此前读到的记录标识，并且它仍是该槽最新记录，
-// 写入才会发生；否则返回 *ConflictError。新记录的父记录就是被覆盖的
-// 那次记录。同一目录下并发覆盖同一父记录时只有一个成功。
+// 写入才会发生；否则返回 *ConflictError——即使该标识对应的旧文件恰好
+// 已损坏或被删除，过期请求也只报冲突，不改报文件错误。标识匹配时还要
+// 确认这条当前记录本身可正常读取：文件缺失返回 *NotFoundError；截断、
+// 校验和不匹配、世界状态不合法或父记录缺失返回 *CorruptError。绝不用
+// 调用方传入的完整世界掩盖当前记录的问题，也不自动改选较老记录为父。
+// 新记录的父记录就是被覆盖的那次记录。同一目录下并发覆盖同一父记录时
+// 只有一个成功。被拒绝的覆盖不改变槽指向、历史与任何已有记录。
 func (a *Archive) Replace(slot string, w *World, expected RecordID) (RecordInfo, error) {
 	if !validSlotName(slot) {
 		return RecordInfo{}, &ConflictError{Slot: slot, Reason: "非法存档槽名"}
@@ -280,6 +285,18 @@ func (a *Archive) Replace(slot string, w *World, expected RecordID) (RecordInfo,
 			Slot:   slot,
 			Reason: "所依据的记录已不是该槽最新记录",
 		}
+	}
+
+	// 标识匹配后，当前记录本身必须可正常读取：完整、内容校验通过、
+	// 世界状态合法且父记录关系成立。否则以它为父保存的新记录随后也
+	// 无法读取，等于用调用方传入的完整世界掩盖了当前记录的问题；
+	// 这里沿用与读取路径一致的校验，损坏或缺失时拒绝覆盖，槽指向、
+	// 历史与已有记录保持原样，调用方可改走恢复预览与确认恢复。
+	if _, err := a.loadAndVerifyLocked(expected); err != nil {
+		if ce, ok := err.(*CorruptError); ok {
+			ce.Slot = slot
+		}
+		return RecordInfo{}, err
 	}
 
 	// 覆盖保存传入世界的快照，以被覆盖的当前记录为父，沿用共同的
