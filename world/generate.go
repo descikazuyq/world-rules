@@ -182,11 +182,15 @@ func generateMap(seed int64, locations []string, required, banned []Edge, roadCo
 		pool[i], pool[j] = pool[j], pool[i]
 	}
 
-	// 先沿洗牌次序连通全图，连通后继续按次序补足目标数量。
+	// 先沿洗牌次序连通全图，连通后继续按次序补足目标数量。连通阶段
+	// 因端点已属同一分量而跳过的道路记入 skipped：它们仍是合法道路，
+	// 目标数量接近可用道路总数时需要靠它们补足，不能像洗牌耗尽一样
+	// 误判为无解（种子只决定选哪张合法地图，不决定请求能否成功）。
 	chosen := make([]Edge, 0, roadCount)
 	for e := range reqSet {
 		chosen = append(chosen, e)
 	}
+	skipped := make([]Edge, 0)
 	for _, e := range pool {
 		if len(chosen) == roadCount {
 			break
@@ -195,13 +199,38 @@ func generateMap(seed int64, locations []string, required, banned []Edge, roadCo
 			if uf.union(index[e.From], index[e.To]) {
 				components--
 				chosen = append(chosen, e)
+			} else {
+				skipped = append(skipped, e)
 			}
 		} else {
 			chosen = append(chosen, e)
 		}
 	}
-	if len(chosen) != roadCount {
-		// 前面的可行性检查已保证不会走到这里。
+	if len(chosen) < roadCount {
+		// 走到这里说明连通全图之前 pool 已耗尽（仅在洗牌次序使关键
+		// 连通边排得靠后、而目标数量又需要几乎全部道路时发生）。补做
+		// 一轮 Kruskal：按洗牌次序加入能合并分量的跳过道路；连通后
+		// 剩余名额按洗牌次序由跳过道路补足。可行性检查已保证这些道路
+		// 足以连通全图，且跳过道路总数足以补足目标数量。
+		extraNeeded := roadCount - len(chosen)
+		for _, e := range skipped {
+			if extraNeeded == 0 {
+				break
+			}
+			if components > 1 {
+				if uf.union(index[e.From], index[e.To]) {
+					components--
+					chosen = append(chosen, e)
+					extraNeeded--
+				}
+			} else {
+				chosen = append(chosen, e)
+				extraNeeded--
+			}
+		}
+	}
+	if len(chosen) != roadCount || components > 1 {
+		// 前面的可行性检查已保证有解时不会走到这里。
 		return nil, nil, ruleErrorf("无法生成 %d 条道路的连通地图", roadCount)
 	}
 	sort.Slice(chosen, func(i, j int) bool {

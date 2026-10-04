@@ -324,6 +324,75 @@ func TestGenerateEverySeedSucceedsWhenSolvable(t *testing.T) {
 	}
 }
 
+func TestGenerateNearFullRoadCount(t *testing.T) {
+	// 目标道路数接近可用道路总数时，不能因洗牌次序而错误拒绝；
+	// 目标等于可用总数时，任何种子都应得到未禁用的全部道路。
+	locs := []string{"a", "b", "c", "d"}
+	var all []Edge
+	for i := 0; i < len(locs); i++ {
+		for j := i + 1; j < len(locs); j++ {
+			all = append(all, Edge{From: locs[i], To: locs[j]})
+		}
+	}
+	wantFive := []Edge{
+		{From: "a", To: "b"}, {From: "a", To: "c"}, {From: "a", To: "d"},
+		{From: "b", To: "c"}, {From: "b", To: "d"},
+	}
+	for seed := int64(-100); seed <= 100; seed++ {
+		// 无必有、无禁用、目标六条：成功且包含全部六条。
+		req := GenerateRequest{Seed: seed, Locations: locs, RoadCount: 6, RulesVersion: "v1"}
+		st := generateWorld(t, req).Snapshot()
+		if !reflect.DeepEqual(st.Rules.Edges, all) {
+			t.Fatalf("种子 %d 未包含全部六条道路: %v", seed, st.Rules.Edges)
+		}
+
+		// 一条道路被禁用、目标五条：恰好包含其余五条（反写也算同一条）。
+		req = GenerateRequest{
+			Seed:         seed,
+			Locations:    locs,
+			Banned:       []Edge{{From: "d", To: "c"}},
+			RoadCount:    5,
+			RulesVersion: "v1",
+		}
+		st = generateWorld(t, req).Snapshot()
+		assertMapShape(t, st, req)
+		if !reflect.DeepEqual(st.Rules.Edges, wantFive) {
+			t.Fatalf("种子 %d 应恰好包含其余五条: %v", seed, st.Rules.Edges)
+		}
+	}
+}
+
+func TestGenerateNearFullWithRequiredCycle(t *testing.T) {
+	// 必有道路已在部分地点间成环时，仍要允许连接剩余地点并满足目标数量。
+	locs := []string{"a", "b", "c", "d"}
+	required := []Edge{
+		{From: "a", To: "b"},
+		{From: "b", To: "c"},
+		{From: "c", To: "a"},
+	}
+	for seed := int64(-50); seed <= 50; seed++ {
+		req := GenerateRequest{
+			Seed:         seed,
+			Locations:    locs,
+			Required:     required,
+			RoadCount:    4,
+			RulesVersion: "v1",
+		}
+		st := generateWorld(t, req).Snapshot()
+		assertMapShape(t, st, req)
+	}
+
+	// 成环且目标仅三条：连不上第四个地点，仍属无解。
+	req := GenerateRequest{
+		Seed: 1, Locations: locs, Required: required, RoadCount: 3, RulesVersion: "v1",
+	}
+	if _, err := GenerateWorld(req); err == nil {
+		t.Fatal("必有成环且目标三条应无解")
+	} else if _, ok := err.(*RuleError); !ok {
+		t.Fatalf("期望 *RuleError，得到 %T", err)
+	}
+}
+
 func TestGenerateInputIsolation(t *testing.T) {
 	req := baseGenerateRequest()
 	w := generateWorld(t, req)
