@@ -5,6 +5,12 @@ package world
 // Version 是非空的规则版本；Locations 是允许出现的地点；Edges 描述地点
 // 之间的连通关系（无向，移动可以沿任一方向发生）；ItemKinds 是允许出现
 // 的物品种类；CarryLimits 给出每个角色可携带物品的总量上限。
+//
+// 全部文本标识（版本、地点、道路两端、物品种类、携带上限的角色键）都必须
+// 是合法 UTF-8：含无效字节的标识会被拒绝，因为保存为 JSON 时它们会被改写
+// 成替换字符，可能让原本不同的标识在存档中重名。合法 UTF-8 中真实存在的
+// “�”、中文、表情符号等按普通标识接受；名称比较是精确相等，不做大小写
+// 转换、去空格或 Unicode 归一化。
 type Rules struct {
 	Version     string
 	Locations   []string
@@ -26,6 +32,8 @@ type CharacterItem struct {
 }
 
 // Character 是一个角色：标识、所在地点和携带物品。
+//
+// 标识、所在地点与物品名称都必须是合法 UTF-8（见 Rules 的说明）。
 type Character struct {
 	ID       string
 	Location string

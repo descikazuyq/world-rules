@@ -169,8 +169,9 @@ func (a *Archive) checkUpgradeLocked(slot string, acceptedVersions []string, tar
 // CheckUpgrade 检查槽当前最新记录能否在目标规则下继续使用。
 //
 // 检查只读取来源记录并计算兼容性，不改变世界、历史或槽当前记录，也不会
-// 替换记录中的规则。target 必须先满足规则自身的合法性要求，且版本与来源
-// 记录不同（版本只按相等判断，不按数字大小限制升级）。
+// 替换记录中的规则。target 必须先满足规则自身的合法性要求（包括全部文本
+// 标识是合法 UTF-8），且版本与来源记录不同（版本只按相等判断，不按数字
+// 大小限制升级）。
 //
 // 目标规则非法返回 *RuleError；版本相同返回 *RuleError；来源损坏返回
 // *CorruptError；来源版本不在 acceptedVersions 内返回 *VersionRejectedError；

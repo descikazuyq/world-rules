@@ -9,7 +9,10 @@ type World struct {
 }
 
 // NewWorld 用初始数据建立世界。时间片从零开始；初始数据违反规则时
-// 返回 *RuleError，且不会产生可用世界。
+// 返回 *RuleError，且不会产生可用世界。规则与角色状态中的文本标识
+// （规则版本、地点、道路两端、物品种类、携带上限的角色键、角色标识、
+// 所在地点、物品名称）必须是合法 UTF-8，含无效字节同样返回 *RuleError，
+// 不会通过删字节、换字符或自动改名来接纳输入。
 func NewWorld(data InitialData) (*World, error) {
 	if err := validateInitialData(data); err != nil {
 		return nil, err
@@ -24,7 +27,8 @@ func NewWorld(data InitialData) (*World, error) {
 
 // WorldFromState 用一份完整状态（典型地来自存档记录）重建世界，
 // 保留其中的时间片。与 NewWorld 不同，它用于“读档后继续”：状态必须
-// 自洽且时间片非负，否则返回 *RuleError。入参会被深拷贝。
+// 自洽且时间片非负，文本标识必须是合法 UTF-8，否则返回 *RuleError。
+// 入参会被深拷贝。
 func WorldFromState(st State) (*World, error) {
 	if st.Time < 0 {
 		return nil, ruleErrorf("时间片不能为负: %d", st.Time)

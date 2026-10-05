@@ -48,7 +48,9 @@ type GenerateRequest struct {
 // 每个种子都能成功生成。
 //
 // 生成不修改调用方输入；规则版本、角色、物品种类与携带上限按输入保留，
-// 时间片从零开始。除此之外与 NewWorld 行为一致。
+// 时间片从零开始。与 NewWorld 一样，规则与角色状态中的全部文本标识必须
+// 是合法 UTF-8，含无效字节时返回 *RuleError，不会产生可用世界。除此之外
+// 与 NewWorld 行为一致。
 func GenerateWorld(req GenerateRequest) (*World, error) {
 	locs, edges, err := generateMap(req.Seed, req.Locations, req.Required, req.Banned, req.RoadCount)
 	if err != nil {
