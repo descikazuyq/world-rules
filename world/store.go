@@ -253,7 +253,7 @@ func (a *Archive) Save(slot string, w *World) (RecordInfo, error) {
 		return RecordInfo{}, err
 	}
 	env := &envelope{
-		Format:    archiveFormatVersion,
+		Format:    recordFormatVersion,
 		ID:        id,
 		SlotFirst: true,
 		State:     st,
@@ -315,9 +315,10 @@ func (a *Archive) createSlotPointer(slot string, id RecordID) error {
 // expected 必须是调用方此前读到的记录标识，并且它仍是该槽最新记录，
 // 写入才会发生；否则返回 *ConflictError——即使该标识对应的旧文件恰好
 // 已损坏或被删除，过期请求也只报冲突，不改报文件错误。标识匹配时还要
-// 确认这条当前记录本身可正常读取：文件缺失返回 *NotFoundError；截断、
-// 校验和不匹配、世界状态不合法或父记录缺失返回 *CorruptError。绝不用
-// 调用方传入的完整世界掩盖当前记录的问题，也不自动改选较老记录为父。
+// 确认这条当前记录本身可正常读取：文件缺失返回 *NotFoundError；格式
+// 编号不受支持、截断、校验和不匹配、世界状态不合法或父记录缺失返回
+// *CorruptError。绝不用调用方传入的完整世界掩盖当前记录的问题，也不
+// 自动改选较老记录为父，更不能借覆盖把未知格式记录重新保存成格式 1。
 // 新记录的父记录就是被覆盖的那次记录。同一目录下并发覆盖同一父记录时
 // 只有一个成功。被拒绝的覆盖不改变槽指向、历史与任何已有记录。
 func (a *Archive) Replace(slot string, w *World, expected RecordID) (RecordInfo, error) {
@@ -391,7 +392,9 @@ func (a *Archive) replaceSlotPointer(slot string, id RecordID) error {
 // Branch 从 srcSlot 的指定历史记录 src 分出新槽 dstSlot。
 //
 // 新槽的首条记录以 src 为父记录，完整复制当时的种子、规则和状态。
-// 目标槽名已存在时返回 *ConflictError。源记录必须校验通过。
+// 目标槽名已存在时返回 *ConflictError。源记录必须格式受支持且校验
+// 通过；使用未知格式编号的记录不能作为分支来源，其内容不会被重新
+// 保存成格式 1。
 func (a *Archive) Branch(srcSlot string, src RecordID, dstSlot string) (RecordInfo, error) {
 	if !validSlotName(srcSlot) {
 		return RecordInfo{}, &ConflictError{Slot: srcSlot, Reason: "非法源存档槽名"}
@@ -429,7 +432,7 @@ func (a *Archive) Branch(srcSlot string, src RecordID, dstSlot string) (RecordIn
 		return RecordInfo{}, err
 	}
 	env := &envelope{
-		Format:    archiveFormatVersion,
+		Format:    recordFormatVersion,
 		ID:        id,
 		Parent:    src,
 		SlotFirst: true,
@@ -470,10 +473,11 @@ func (a *Archive) assertInSlotHistoryLocked(slot string, id RecordID) error {
 // 槽首记录在末尾）。
 //
 // 优先使用指针内嵌的历史索引；旧版本指针没有该索引时，在内存中沿
-// “校验通过”的记录父链回退重建，绝不在读取路径上改写目录。重建在缺失、
-// 无法解析或校验不过的记录处停止——无法确认归属的更老记录不再使用。
-// 槽首标记只取自校验通过的信封，因此受损记录里被篡改的父标识或槽首
-// 标记既不能把遍历引向别的槽，也不能遮住本槽更早的可用记录。
+// “校验通过（含记录格式编号为 1）”的记录父链回退重建，绝不在读取
+// 路径上改写目录。重建在缺失、无法解析、格式不受支持或校验不过的记录
+// 处停止——无法确认归属的更老记录不再使用，也不借助其中的父标识继续
+// 查找。槽首标记只取自校验通过的信封，因此受损或未知格式记录里的父
+// 标识或槽首标记既不能把遍历引向别的槽，也不能遮住本槽更早的可用记录。
 func (a *Archive) slotHistoryLocked(slot string) ([]RecordID, error) {
 	p, err := a.readSlotPointerLocked(slot)
 	if err != nil {
@@ -487,7 +491,8 @@ func (a *Archive) slotHistoryLocked(slot string) ([]RecordID, error) {
 }
 
 // rebuildHistoryLocked 从 latest 起沿校验通过的父链在内存中重建历史，
-// 只返回仍能确认属于本槽的记录；在缺失、无法解析或校验不过的记录处停止。
+// 只返回仍能确认属于本槽的记录；在缺失、无法解析、格式不受支持或校验
+// 不过的记录处停止，不沿该记录里的父标识继续向更老记录查找。
 func (a *Archive) rebuildHistoryLocked(latest RecordID) ([]RecordID, error) {
 	var chain []RecordID
 	seen := map[RecordID]bool{}

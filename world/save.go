@@ -40,7 +40,7 @@ func (a *Archive) appendSlotRecordLocked(sv slotSave) (RecordInfo, error) {
 		return RecordInfo{}, err
 	}
 	env := &envelope{
-		Format: archiveFormatVersion,
+		Format: recordFormatVersion,
 		ID:     id,
 		Parent: sv.parent,
 		// 追加记录即使复制自槽首来源，也只是本槽保存次序最前的一条
