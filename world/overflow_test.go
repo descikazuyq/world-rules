@@ -487,12 +487,21 @@ func TestReadRejectsLimitViolatingRecord(t *testing.T) {
 	if latest != badID {
 		t.Fatalf("槽当前记录不应改变，得到 %s", latest)
 	}
+	// 历史列表只列通过完整性检查的记录：校验和正确但世界状态非法的
+	// badID 被略过，只留 goodID；槽指针内嵌历史索引不被改写。
 	history, err := a.History("slot")
 	if err != nil {
 		t.Fatalf("History: %v", err)
 	}
-	if len(history) != 2 || history[0].ID != badID || history[1].ID != goodID {
-		t.Fatalf("历史不应改变: %+v", history)
+	if len(history) != 1 || history[0].ID != goodID {
+		t.Fatalf("历史列表应只列完好记录: %+v", history)
+	}
+	p, err := a.readSlotPointerLocked("slot")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.History) != 2 || p.History[0] != badID || p.History[1] != goodID {
+		t.Fatalf("历史索引不应改变: %v", p.History)
 	}
 }
 

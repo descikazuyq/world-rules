@@ -180,8 +180,18 @@ func (a *Archive) Record(slot string, id RecordID, acceptedVersions []string) (R
 
 // History 返回槽的历史记录元信息，按该槽保存生效的次序排列（最新在
 // 前），到槽首条记录为止；分支槽只含它自己保存成功的记录，不会跨入
-// 分支来源槽。次序来自槽指针内嵌的历史索引，与文件修改时间无关。该
-// 方法只做只读遍历，不改写任何数据；无法解析的记录会被略过。
+// 分支来源槽。次序来自槽指针内嵌的历史索引，与文件修改时间、世界时间
+// 片或规则版本无关。
+//
+// 列出的每条元信息都对应历史中一份确实保存生效、且通过与 Record 一致
+// 的完整性检查的记录：标识与文件一致、记录格式受支持、内容校验和正确
+// （含父记录关系）、世界状态合法、直接父记录文件存在。损坏、缺失或无
+// 法解析的单条记录一律略过，继续返回其余合格记录——最新记录或某条中间
+// 记录出问题不会让整个列表失败；全部记录都被略过时返回空列表与成功
+// 结果。完整性检查不包含规则版本取舍：History 没有可接受版本参数，
+// 完好但规则版本较旧的记录仍正常列出。该方法只做只读遍历，不修补或
+// 删除记录、不改变槽当前指向、不改写历史与世界规则。槽不存在返回
+// *NotFoundError，槽指针无法解析返回 *CorruptError。
 func (a *Archive) History(slot string) ([]RecordInfo, error) {
 	if !validSlotName(slot) {
 		return nil, &NotFoundError{Slot: slot}
@@ -198,8 +208,11 @@ func (a *Archive) History(slot string) ([]RecordInfo, error) {
 	}
 	infos := make([]RecordInfo, 0, len(history))
 	for _, id := range history {
-		env, err := loadRecord(recordPath(a.dir, id))
-		if err != nil {
+		// 与 Record 相同的完整性检查（不做规则版本取舍）：任何一条
+		// 记录损坏、缺失或无法解析都只略过它本身，不读其中的父标识或
+		// 槽首标记去扩大或缩小遍历范围，也不让整个列表失败。
+		env, verifyErr := a.loadAndVerifyLocked(id)
+		if verifyErr != nil {
 			continue
 		}
 		infos = append(infos, RecordInfo{

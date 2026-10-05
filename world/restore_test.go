@@ -298,18 +298,32 @@ func TestConfirmRecoveryCopiesSourceAndRewritesSlot(t *testing.T) {
 		t.Fatalf("角色位置与物品内容/排列未原样复制: %+v", hero)
 	}
 
-	// 历史次序：新记录最前，其后旧历史按原保存次序保留（损坏记录仍在索引）。
+	// 历史列表只列通过完整性检查的记录：损坏的 r1 被略过，其余按原保存
+	// 次序保留；槽指针内嵌的历史索引仍是只读遍历的依据，不被改写。
 	hist, err := a.History("s")
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantHist := []RecordID{info.ID, r1.ID, r0.ID}
+	wantHist := []RecordID{info.ID, r0.ID}
 	if len(hist) != len(wantHist) {
-		t.Fatalf("历史长度错误: %+v", hist)
+		t.Fatalf("历史列表应略过损坏记录: %+v", hist)
 	}
 	for i := range wantHist {
 		if hist[i].ID != wantHist[i] {
 			t.Fatalf("历史次序错误: %+v，期望 %v", hist, wantHist)
+		}
+	}
+	p, err := a.readSlotPointerLocked("s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantIndex := []RecordID{info.ID, r1.ID, r0.ID}
+	if len(p.History) != len(wantIndex) {
+		t.Fatalf("历史索引不应改写: %v", p.History)
+	}
+	for i := range wantIndex {
+		if p.History[i] != wantIndex[i] {
+			t.Fatalf("历史索引不应改写: %v", p.History)
 		}
 	}
 
