@@ -170,29 +170,14 @@ func addInt(a, b int) (int, bool) {
 }
 
 // migrationComputeLocked 在调用方已持锁（共享或排他均可）的前提下读取并
-// 校验槽当前最新记录，校验转换对应关系，计算转换后的状态与阻碍。不写入。
+// 校验槽当前最新记录，校验转换对应关系，计算转换后的状态与阻碍。来源
+// 读取、完整性检查、可接受版本与版本相异判断共用
+// sourceForTransformLocked，本函数只负责迁移自己的对应关系校验、转换与
+// 阻碍计算。不写入。
 func (a *Archive) migrationComputeLocked(slot string, acceptedVersions []string, target Rules, locations, items []NameMapping) (MigrationPreview, *envelope, error) {
-	latest, err := a.readLatestLocked(slot)
+	latest, env, err := a.sourceForTransformLocked(slot, acceptedVersions, target.Version)
 	if err != nil {
 		return MigrationPreview{}, nil, err
-	}
-	env, err := a.loadAndVerifyLocked(latest)
-	if err != nil {
-		if ce, ok := err.(*CorruptError); ok {
-			ce.Slot = slot
-		}
-		return MigrationPreview{}, nil, err
-	}
-	if !versionAccepted(env.State.Rules.Version, acceptedVersions) {
-		return MigrationPreview{}, nil, &VersionRejectedError{
-			Slot:     slot,
-			Record:   latest,
-			Version:  env.State.Rules.Version,
-			Accepted: append([]string(nil), acceptedVersions...),
-		}
-	}
-	if target.Version == env.State.Rules.Version {
-		return MigrationPreview{}, nil, &RuleError{Reason: "目标规则版本必须与来源记录版本不同"}
 	}
 	if err := validateMappings(env.State.Rules, target, locations, items); err != nil {
 		return MigrationPreview{}, nil, err
