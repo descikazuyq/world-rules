@@ -37,6 +37,11 @@ go test ./...
   引向别的槽。分支只在分支自身的记录中查找，越界不查；没有任何可用
   记录时返回 `ErrUnrecoverable`。旧版本裸指针可直接打开，第一次成功
   覆盖或升级后旧历史即获得同样的恢复能力。读取不改写任何数据。
+- `History(slot)` 浏览槽的历史列表：按保存生效次序（最近在前）返回
+  每条记录的标识、父标识、槽首标记与规则版本，供挑选后用 `Record`
+  按标识读取当时的完整世界。浏览不筛选规则版本、不切换槽当前记录、
+  不修补记录；损坏或缺失的单条记录被略过，槽存在但没有合格记录时
+  返回空列表。详见下文“浏览存档槽的历史记录”。
 - `PreviewRecovery(slot, acceptedVersions)` 在不改变存档的前提下返回槽
   当前指向的记录标识、选中的来源记录标识及其完整世界状态；选择规则与
   `RecoverLatest` 相同，当前记录完好且版本可接受时可以选它本身。槽不
@@ -333,4 +338,226 @@ func main() {
 	// 最终: time=9 hero@forest wood=3 ore=2
 }
 ```
+
+## 浏览存档槽的历史记录
+
+`Latest`/`Record` 适合按已知标识读取；要**先查看一个槽已经保存了哪些
+历史**再决定读哪一份，用 `History(slot)`：它按保存生效的先后次序列出
+每条记录的元信息（`RecordInfo`：记录标识 `ID`、父标识 `Parent`、槽首
+标记 `SlotFirst`、规则版本 `Version`），最近保存的排在最前。浏览到感
+兴趣的标识后，用 `Record(slot, info.ID, acceptedVersions)` 读取当时的
+完整世界。
+
+### 列表顺序与父记录关系
+
+- 历史按**保存生效的先后**排列，最近保存的在前；不按世界时间片大小，
+  也不按文件修改时间排序。
+- 列表次序与父记录关系相互独立：`ConfirmRecovery` 确认恢复后，新记录
+  以选中的来源（可能是列表中较早的记录）为父并排在最前，列表仍保留
+  原先已经生效的其他保存，次序不变。
+- 分支槽只列出分支自身的记录：分支首条记录虽以来源槽的记录为父，
+  来源槽的历史不会列进来。
+- 因此“槽首记录”不等于“父标识为空”：只有**直接建立**的槽首记录没有
+  父记录；分支首记录的父标识指向来源槽的记录，并不为空。
+
+### 列表里的记录能否立即使用
+
+- `History` 不筛选规则版本：完好但版本较旧的记录仍会列出。用 `Record`
+  读取时必须明确给出可接受版本集合；版本不被接受会得到
+  `*VersionRejectedError`，这不说明历史列表有错。
+- 带历史索引的槽中，损坏或缺失的单条记录会被略过，其余合格记录继续
+  列出。父关系只看直接父文件是否存在：直接父文件被删除时其子记录
+  一并略过；父文件仍在但内容损坏时，不因此略过自身完好的子记录。
+- 没有历史索引的旧格式槽只列出能确认归属的历史（沿校验通过的父链
+  重建），不能承诺越过损坏处继续寻找更老的记录。
+- 槽存在但没有合格记录时返回**成功的空列表**；槽不存在返回
+  `*NotFoundError`，槽指针无法解析返回 `*CorruptError`——后两者是
+  错误，不能与空列表混为一谈。
+
+浏览（`History`）和按标识读取（`Record`）都是只读操作：不切换槽当前
+记录、不修补记录，也不替换世界规则。读档继续与分支的用法见上文，保持
+不变。
+
+### 完整示例
+
+下面的程序可直接阅读使用（可运行版本在
+`world/example_history_test.go`，`go test ./...` 会校验其输出）：自行
+建立存档并产生三次保存，浏览历史列表查看记录标识、父标识、槽首标记与
+规则版本，再选取中间一份旧记录读取当时的非零时间片与角色状态，并与
+当前记录对照。
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+	"log"
+	"os"
+
+	"github.com/descikazuyq/world-rules/world"
+)
+
+func printState(tag string, s world.State) {
+	c := s.Characters[0]
+	fmt.Printf("%s: time=%d %s@%s", tag, s.Time, c.ID, c.Location)
+	for _, it := range c.Items {
+		fmt.Printf(" %s=%d", it.Item, it.Count)
+	}
+	fmt.Println()
+}
+
+func main() {
+	const slot = "adventure"
+	acceptedV1 := []string{"v1"}
+
+	// 示例规则：三个地点、两条无向道路、两种物品，hero 携带总量上限 10。
+	rules := world.Rules{
+		Version:   "v1",
+		Locations: []string{"village", "forest", "mine"},
+		Edges: []world.Edge{
+			{From: "village", To: "forest"},
+			{From: "forest", To: "mine"},
+		},
+		ItemKinds:   []string{"wood", "ore"},
+		CarryLimits: map[string]int{"hero": 10},
+	}
+
+	dir, err := os.MkdirTemp("", "world-history-*")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+
+	// 1) 建立世界并产生三次保存：首次保存创建槽（槽首记录），之后两次
+	// 带记录标识覆盖，各得到一条独立的新记录。
+	w, err := world.NewWorld(world.InitialData{
+		Seed:  20240801,
+		Rules: rules,
+		Characters: []world.Character{{
+			ID:       "hero",
+			Location: "village",
+			Items: []world.CharacterItem{
+				{Item: "wood", Count: 2},
+				{Item: "ore", Count: 1},
+			},
+		}},
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	arch0, err := world.Create(dir)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// 保存 1：village->forest，wood +1，目标绝对时间片 4。
+	if _, err := w.Apply(world.Commit{
+		Moves:       []world.Move{{Character: "hero", To: "forest"}},
+		ItemChanges: []world.ItemChange{{Character: "hero", Item: "wood", Delta: 1}},
+		Time:        4,
+	}); err != nil {
+		log.Fatal(err)
+	}
+	save1, err := arch0.Save(slot, w)
+	if err != nil {
+		log.Fatal(err)
+	}
+	printState("保存1", w.Snapshot())
+
+	// 保存 2：forest->mine，ore +2，目标时间片 7；以保存 1 为父。
+	if _, err := w.Apply(world.Commit{
+		Moves:       []world.Move{{Character: "hero", To: "mine"}},
+		ItemChanges: []world.ItemChange{{Character: "hero", Item: "ore", Delta: 2}},
+		Time:        7,
+	}); err != nil {
+		log.Fatal(err)
+	}
+	save2, err := arch0.Replace(slot, w, save1.ID)
+	if err != nil {
+		log.Fatal(err)
+	}
+	printState("保存2", w.Snapshot())
+
+	// 保存 3：mine->forest，ore -1，目标时间片 9；以保存 2 为父。
+	if _, err := w.Apply(world.Commit{
+		Moves:       []world.Move{{Character: "hero", To: "forest"}},
+		ItemChanges: []world.ItemChange{{Character: "hero", Item: "ore", Delta: -1}},
+		Time:        9,
+	}); err != nil {
+		log.Fatal(err)
+	}
+	save3, err := arch0.Replace(slot, w, save2.ID)
+	if err != nil {
+		log.Fatal(err)
+	}
+	printState("保存3", w.Snapshot())
+	// 保存1: time=4 hero@forest wood=3 ore=1
+	// 保存2: time=7 hero@mine wood=3 ore=3
+	// 保存3: time=9 hero@forest wood=3 ore=2
+
+	// 2) 另一次会话：重新打开存档，浏览历史列表。列表按保存生效的先后
+	// 排列，最近保存的在前；每项给出记录标识、父标识、槽首标记与规则
+	// 版本。浏览是只读操作。
+	arch, err := world.Open(dir)
+	if err != nil {
+		log.Fatal(err)
+	}
+	infos, err := arch.History(slot)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("历史条数: %d\n", len(infos))
+	fmt.Printf("历史[0]: 是保存3=%t 父为保存2=%t 槽首=%t 版本=%s\n",
+		infos[0].ID == save3.ID, infos[0].Parent == save2.ID,
+		infos[0].SlotFirst, infos[0].Version)
+	fmt.Printf("历史[1]: 是保存2=%t 父为保存1=%t 槽首=%t 版本=%s\n",
+		infos[1].ID == save2.ID, infos[1].Parent == save1.ID,
+		infos[1].SlotFirst, infos[1].Version)
+	// 只有直接建立的槽首记录父标识为空。
+	fmt.Printf("历史[2]: 是保存1=%t 父标识为空=%t 槽首=%t 版本=%s\n",
+		infos[2].ID == save1.ID, infos[2].Parent == "",
+		infos[2].SlotFirst, infos[2].Version)
+	// 历史条数: 3
+	// 历史[0]: 是保存3=true 父为保存2=true 槽首=false 版本=v1
+	// 历史[1]: 是保存2=true 父为保存1=true 槽首=false 版本=v1
+	// 历史[2]: 是保存1=true 父标识为空=true 槽首=true 版本=v1
+
+	// 3) 从列表中选取中间那份旧记录，用 Record 按标识读取当时的完整
+	// 世界：非零时间片 7 与当时的角色状态原样取回，与当前记录（时间片
+	// 9、位置与物品不同）相互独立。
+	pick := infos[1]
+	old, err := arch.Record(slot, pick.ID, acceptedV1)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("选取: 标识与列表一致=%t 父与列表一致=%t\n",
+		old.ID == pick.ID, old.Parent == pick.Parent)
+	printState("旧记录", old.State)
+	// 选取: 标识与列表一致=true 父与列表一致=true
+	// 旧记录: time=7 hero@mine wood=3 ore=3
+
+	// 列表中的版本只是元信息，History 不筛选版本；用 Record 读取时必须
+	// 显式给出可接受版本，版本不被接受得到版本拒绝，这不说明列表有错。
+	if _, err := arch.Record(slot, pick.ID, []string{"v9"}); err != nil {
+		var vr *world.VersionRejectedError
+		if !errors.As(err, &vr) {
+			log.Fatal(err)
+		}
+		fmt.Printf("版本拒绝: 记录版本=%s\n", vr.Version)
+	}
+	// 版本拒绝: 记录版本=v1
+
+	// 浏览与读取都不切换槽当前记录：Latest 仍返回最近一次保存。
+	cur, err := arch.Latest(slot, acceptedV1)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("当前仍是保存3=%t\n", cur.ID == save3.ID)
+	printState("当前", cur.State)
+	// 当前仍是保存3=true
+	// 当前: time=9 hero@forest wood=3 ore=2
+}
+```
+
 
