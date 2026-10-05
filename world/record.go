@@ -17,6 +17,12 @@ type RecordID string
 // archiveFormatVersion 是存档目录布局版本，写入目录标记中。
 const archiveFormatVersion = 1
 
+// recordFormatVersion 是当前唯一支持的记录格式版本。记录格式与存档目录
+// 布局版本是两个独立的编号：目录可打开不代表其中每条记录都能被理解，
+// 格式编号不是该值的记录（缺失、零、负值或其他正整数）一律按损坏处理，
+// 即使其校验和匹配、世界状态合法。
+const recordFormatVersion = 1
+
 // envelope 是记录文件在磁盘上的完整编码。
 type envelope struct {
 	// Format 是记录格式版本。
