@@ -298,18 +298,33 @@ func TestConfirmRecoveryCopiesSourceAndRewritesSlot(t *testing.T) {
 		t.Fatalf("角色位置与物品内容/排列未原样复制: %+v", hero)
 	}
 
-	// 历史次序：新记录最前，其后旧历史按原保存次序保留（损坏记录仍在索引）。
+	// 历史次序：新记录最前，其后旧历史按原保存次序保留在指针索引中
+	// （查询不改写索引）；但损坏的 r1 通不过完整性检查，History 不展示它。
 	hist, err := a.History("s")
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantHist := []RecordID{info.ID, r1.ID, r0.ID}
+	wantHist := []RecordID{info.ID, r0.ID}
 	if len(hist) != len(wantHist) {
-		t.Fatalf("历史长度错误: %+v", hist)
+		t.Fatalf("历史应只含校验通过的记录: %+v", hist)
 	}
 	for i := range wantHist {
 		if hist[i].ID != wantHist[i] {
 			t.Fatalf("历史次序错误: %+v，期望 %v", hist, wantHist)
+		}
+	}
+	// 指针内嵌的历史索引本身仍保留损坏记录，确认恢复没有截断或修补它。
+	p, err := a.readSlotPointerLocked("s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantIndex := []RecordID{info.ID, r1.ID, r0.ID}
+	if len(p.History) != len(wantIndex) {
+		t.Fatalf("指针内嵌历史不应被查询或确认改写: %v", p.History)
+	}
+	for i := range wantIndex {
+		if p.History[i] != wantIndex[i] {
+			t.Fatalf("指针内嵌历史次序错误: %v", p.History)
 		}
 	}
 

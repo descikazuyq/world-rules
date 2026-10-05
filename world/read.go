@@ -180,8 +180,26 @@ func (a *Archive) Record(slot string, id RecordID, acceptedVersions []string) (R
 
 // History 返回槽的历史记录元信息，按该槽保存生效的次序排列（最新在
 // 前），到槽首条记录为止；分支槽只含它自己保存成功的记录，不会跨入
-// 分支来源槽。次序来自槽指针内嵌的历史索引，与文件修改时间无关。该
-// 方法只做只读遍历，不改写任何数据；无法解析的记录会被略过。
+// 分支来源槽。次序来自槽指针内嵌的历史索引，与文件修改时间、世界时间片
+// 大小及规则版本无关。
+//
+// 列出的每一项都对应历史中一份通过现有记录完整性检查的实际记录，与
+// [Archive.Record] 读取时采用同一套检查：记录标识与文件名一致、记录格式
+// 受支持、内容校验和正确（含父记录关系）、直接父记录文件存在、世界状态
+// 合法。文件缺失、无法解析或任一检查不通过的单条记录直接略过，继续返回
+// 其余合格记录——最新记录或中间记录出问题都不会让整个列表失败。父文件
+// 存在但自身内容损坏时，只要子记录自身通过检查就照常列出；父文件被删除
+// 而使子记录的父记录存在性要求不再满足时，该子记录一并略过。元信息中的
+// 标识、父标识、槽首标记与规则版本均取自校验通过的信封，不信任受损记录
+// 里的任何字段。
+//
+// 完整性检查与规则版本是否适合调用方使用是两回事：History 没有可接受
+// 版本参数，因此不做版本过滤，规则版本较旧但其余完好的记录仍正常列出。
+// 槽存在且历史可确定、但所有记录都被略过时，返回空列表与 nil 错误；槽
+// 不存在返回 *NotFoundError，槽指针无法解析返回 *CorruptError。旧格式裸
+// 指针继续沿校验通过的父链在内存中重建历史归属，归属范围与恢复读取一致。
+// 该方法只做只读遍历，不修补或删除记录，不改变槽当前指向，也不改写历史
+// 与世界规则。
 func (a *Archive) History(slot string) ([]RecordInfo, error) {
 	if !validSlotName(slot) {
 		return nil, &NotFoundError{Slot: slot}
@@ -198,8 +216,10 @@ func (a *Archive) History(slot string) ([]RecordInfo, error) {
 	}
 	infos := make([]RecordInfo, 0, len(history))
 	for _, id := range history {
-		env, err := loadRecord(recordPath(a.dir, id))
-		if err != nil {
+		// 与 Record 相同的完整性检查（但不含规则版本接受判断）：任一环节
+		// 不通过只略过这一条，不影响其余合格记录，也不改变遍历次序。
+		env, verifyErr := a.loadAndVerifyLocked(id)
+		if verifyErr != nil {
 			continue
 		}
 		infos = append(infos, RecordInfo{
