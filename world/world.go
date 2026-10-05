@@ -150,19 +150,14 @@ func (s State) apply(c Commit) (State, error) {
 			ch.Items = append(ch.Items, CharacterItem{Item: name, Count: count})
 		}
 	}
-	// 携带上限按真实总量判断：精确求和，不因加法回绕而放过超限。未设
-	// 上限的角色不检查总量，其总量允许超过 int 最大值。
+	// 携带上限按同一角色全部增减后的最终数量、以真实总量判断，规则与建立/
+	// 重建世界共用同一口径：精确求和不因加法回绕放过超限；未设上限的角色
+	// 不检查总量，其总量允许超过 int 最大值。中途暂时超限但最终合法的提交
+	// 在此仍判定为成功；最终超限时返回规则错误，整次提交（移动、物品变化、
+	// 时间推进）均未落到世界上——工作副本是 next，调用方的世界保持原样。
 	for _, ch := range next.Characters {
-		limit, ok := next.Rules.CarryLimits[ch.ID]
-		if !ok {
-			continue
-		}
-		total := new(big.Int)
-		for _, it := range ch.Items {
-			total.Add(total, bigInt(it.Count))
-		}
-		if total.Cmp(bigInt(limit)) > 0 {
-			return State{}, ruleErrorf("角色 %q 携带总量 %s 超过上限 %d", ch.ID, total.String(), limit)
+		if err := carryLimitError(ch.ID, ch.Items, next.Rules.CarryLimits); err != nil {
+			return State{}, err
 		}
 	}
 

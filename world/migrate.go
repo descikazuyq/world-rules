@@ -146,14 +146,13 @@ func applyMigration(st State, locations, items []NameMapping) (State, error) {
 		ch.Items = merged
 
 		// 携带总量溢出检查：各物品数量都合法，但不同物品相加可能超出
-		// int 范围，同样不能回绕或丢弃。
-		total := 0
-		for _, it := range ch.Items {
-			sum, ok := addInt(total, it.Count)
-			if !ok {
-				return State{}, ruleErrorf("角色 %q 携带总量超出整数范围", ch.ID)
-			}
-			total = sum
+		// int 范围，同样不能回绕或丢弃。这是显式迁移特有的整数范围门槛，
+		// 与携带上限判断不同：无论目标规则是否给该角色设置上限，真实总量
+		// 超出 int 范围都拒绝，不能因为共用总量判断而把“无上限”当成允许
+		// 溢出迁移。精确求和与其余入口共用 carryTotal，此处只保留自己的
+		// 溢出判定。
+		if carryTotal(ch.Items).Cmp(maxIntBig) > 0 {
+			return State{}, ruleErrorf("角色 %q 携带总量超出整数范围", ch.ID)
 		}
 	}
 	return out, nil
