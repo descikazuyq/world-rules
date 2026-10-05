@@ -146,30 +146,13 @@ func checkCompatibility(st State, target Rules) []Blocker {
 	return blockers
 }
 
-// checkUpgradeLocked 在调用方已持锁（共享或排他均可）的前提下读取并校验
-// 槽当前最新记录，计算目标规则的兼容性。返回检查结果与来源记录信封。
+// checkUpgradeLocked 在调用方已持锁（共享或排他均可）的前提下完成升级与
+// 迁移共用的转换前来源判断，再计算目标规则的兼容性。返回检查结果与来源
+// 记录信封。
 func (a *Archive) checkUpgradeLocked(slot string, acceptedVersions []string, target Rules) (UpgradeCheck, *envelope, error) {
-	latest, err := a.readLatestLocked(slot)
+	latest, env, err := a.readConversionSourceLocked(slot, acceptedVersions, target.Version)
 	if err != nil {
 		return UpgradeCheck{}, nil, err
-	}
-	env, err := a.loadAndVerifyLocked(latest)
-	if err != nil {
-		if ce, ok := err.(*CorruptError); ok {
-			ce.Slot = slot
-		}
-		return UpgradeCheck{}, nil, err
-	}
-	if !versionAccepted(env.State.Rules.Version, acceptedVersions) {
-		return UpgradeCheck{}, nil, &VersionRejectedError{
-			Slot:     slot,
-			Record:   latest,
-			Version:  env.State.Rules.Version,
-			Accepted: append([]string(nil), acceptedVersions...),
-		}
-	}
-	if target.Version == env.State.Rules.Version {
-		return UpgradeCheck{}, nil, &RuleError{Reason: "目标规则版本必须与来源记录版本不同"}
 	}
 	check := UpgradeCheck{
 		RecordID:      latest,

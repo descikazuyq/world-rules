@@ -95,6 +95,46 @@ func versionAccepted(version string, accepted []string) bool {
 	return false
 }
 
+// readConversionSourceLocked 执行规则升级与显式迁移共用的“转换前来源判断”，
+// 在调用方已持锁（共享或排他均可）的前提下读取并校验槽当前指向的记录：
+//
+//   - 只使用槽指针当前指向的最新记录，不因它有问题而改选更早的记录；
+//   - 槽不存在或来源文件缺失返回 *NotFoundError；
+//   - 槽指针无法解析、来源格式不受支持、校验和不符、世界状态非法或直接
+//     父记录缺失返回 *CorruptError，并补全槽名、保留记录标识与原因；
+//   - 完整性检查先于版本取舍：来源同时损坏且版本不被接受时先报损坏；
+//   - 来源完好但规则版本不在 acceptedVersions 内返回 *VersionRejectedError，
+//     Accepted 为入参切片的拷贝，调用方随后修改传入的版本列表不影响已返回
+//     的错误内容；
+//   - 目标版本与来源版本只按字符串相等判断，相同时返回 *RuleError。
+//
+// 通过全部判断后返回来源记录标识与其信封；判断失败时标识为空、信封为 nil。
+func (a *Archive) readConversionSourceLocked(slot string, acceptedVersions []string, targetVersion string) (RecordID, *envelope, error) {
+	latest, err := a.readLatestLocked(slot)
+	if err != nil {
+		return "", nil, err
+	}
+	env, err := a.loadAndVerifyLocked(latest)
+	if err != nil {
+		if ce, ok := err.(*CorruptError); ok {
+			ce.Slot = slot
+		}
+		return "", nil, err
+	}
+	if !versionAccepted(env.State.Rules.Version, acceptedVersions) {
+		return "", nil, &VersionRejectedError{
+			Slot:     slot,
+			Record:   latest,
+			Version:  env.State.Rules.Version,
+			Accepted: append([]string(nil), acceptedVersions...),
+		}
+	}
+	if targetVersion == env.State.Rules.Version {
+		return "", nil, &RuleError{Reason: "目标规则版本必须与来源记录版本不同"}
+	}
+	return latest, env, nil
+}
+
 func envToRecord(env *envelope) Record {
 	return Record{
 		ID:        env.ID,
