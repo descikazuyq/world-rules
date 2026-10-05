@@ -2,7 +2,6 @@ package world
 
 import (
 	"fmt"
-	"math/big"
 	"sort"
 )
 
@@ -90,7 +89,6 @@ func checkCompatibility(st State, target Rules) []Blocker {
 				Location:  ch.Location,
 			})
 		}
-		total := new(big.Int)
 		for _, it := range ch.Items {
 			if _, ok := kindSet[it.Item]; !ok {
 				blockers = append(blockers, Blocker{
@@ -99,24 +97,25 @@ func checkCompatibility(st State, target Rules) []Blocker {
 					Item:      it.Item,
 				})
 			}
-			total.Add(total, bigInt(it.Count))
 		}
 		// 携带上限按真实总量判断：精确求和，不因加法回绕而放过超限。
 		// 真实总量能用 int 表示时沿用 Total 字段；超出 int 范围时置
 		// TotalOverflow 并给出完整十进制 TotalText。
-		if limit, ok := target.CarryLimits[ch.ID]; ok && total.Cmp(bigInt(limit)) > 0 {
-			b := Blocker{
-				Character: ch.ID,
-				Kind:      BlockerLimit,
-				Limit:     limit,
+		if limit, ok := target.CarryLimits[ch.ID]; ok {
+			if total := carryTotal(ch.Items); total.Cmp(bigInt(limit)) > 0 {
+				b := Blocker{
+					Character: ch.ID,
+					Kind:      BlockerLimit,
+					Limit:     limit,
+				}
+				if total.Cmp(maxIntBig) <= 0 {
+					b.Total = int(total.Int64())
+				} else {
+					b.TotalOverflow = true
+					b.TotalText = total.String()
+				}
+				blockers = append(blockers, b)
 			}
-			if total.Cmp(maxIntBig) <= 0 {
-				b.Total = int(total.Int64())
-			} else {
-				b.TotalOverflow = true
-				b.TotalText = total.String()
-			}
-			blockers = append(blockers, b)
 		}
 	}
 	// 同类问题按角色标识、物品标识排序；location/limit 阻碍没有物品标识，

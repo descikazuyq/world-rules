@@ -146,14 +146,10 @@ func applyMigration(st State, locations, items []NameMapping) (State, error) {
 		ch.Items = merged
 
 		// 携带总量溢出检查：各物品数量都合法，但不同物品相加可能超出
-		// int 范围，同样不能回绕或丢弃。
-		total := 0
-		for _, it := range ch.Items {
-			sum, ok := addInt(total, it.Count)
-			if !ok {
-				return State{}, ruleErrorf("角色 %q 携带总量超出整数范围", ch.ID)
-			}
-			total = sum
+		// int 范围，同样不能回绕或丢弃。迁移不接受超出 int 范围的真实
+		// 总量，与是否设置携带上限无关。
+		if carryTotal(ch.Items).Cmp(maxIntBig) > 0 {
+			return State{}, ruleErrorf("角色 %q 携带总量超出整数范围", ch.ID)
 		}
 	}
 	return out, nil

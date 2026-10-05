@@ -150,19 +150,11 @@ func (s State) apply(c Commit) (State, error) {
 			ch.Items = append(ch.Items, CharacterItem{Item: name, Count: count})
 		}
 	}
-	// 携带上限按真实总量判断：精确求和，不因加法回绕而放过超限。未设
-	// 上限的角色不检查总量，其总量允许超过 int 最大值。
+	// 携带上限按合并后的最终数量判断真实总量；未设上限的角色不检查
+	// 总量，其总量允许超过 int 最大值。
 	for _, ch := range next.Characters {
-		limit, ok := next.Rules.CarryLimits[ch.ID]
-		if !ok {
-			continue
-		}
-		total := new(big.Int)
-		for _, it := range ch.Items {
-			total.Add(total, bigInt(it.Count))
-		}
-		if total.Cmp(bigInt(limit)) > 0 {
-			return State{}, ruleErrorf("角色 %q 携带总量 %s 超过上限 %d", ch.ID, total.String(), limit)
+		if err := checkCarryLimit(ch.ID, ch.Items, next.Rules.CarryLimits); err != nil {
+			return State{}, err
 		}
 	}
 
