@@ -3,6 +3,7 @@ package world
 import (
 	"fmt"
 	"math"
+	"unicode/utf8"
 )
 
 // NameMapping 描述旧规则中一个名称到新规则名称的显式转换关系。
@@ -78,6 +79,12 @@ func validateMappings(old, target Rules, locations, items []NameMapping) error {
 func validateMappingSet(kind string, mappings []NameMapping, oldNames, newNames map[string]struct{}) error {
 	seen := make(map[string]struct{}, len(mappings))
 	for i, m := range mappings {
+		if !utf8.ValidString(m.From) {
+			return ruleErrorf("%s转换关系 %d 的来源名称不是合法 UTF-8: %q", kind, i, m.From)
+		}
+		if !utf8.ValidString(m.To) {
+			return ruleErrorf("%s转换关系 %d 的目标名称不是合法 UTF-8: %q", kind, i, m.To)
+		}
 		if m.From == "" {
 			return ruleErrorf("%s转换关系 %d 的来源名称为空", kind, i)
 		}

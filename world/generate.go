@@ -1,6 +1,9 @@
 package world
 
-import "sort"
+import (
+	"sort"
+	"unicode/utf8"
+)
 
 // maxGenerateLocations 是生成地图允许的最大地点数量。
 const maxGenerateLocations = 256
@@ -86,6 +89,9 @@ func generateMap(seed int64, locations []string, required, banned []Edge, roadCo
 	sort.Strings(locs)
 	locSet := make(map[string]struct{}, n)
 	for _, l := range locs {
+		if !utf8.ValidString(l) {
+			return nil, nil, ruleErrorf("地点标识不是合法 UTF-8: %q", l)
+		}
 		if l == "" {
 			return nil, nil, ruleErrorf("地点标识不能为空")
 		}
@@ -242,9 +248,15 @@ func generateMap(seed int64, locations []string, required, banned []Edge, roadCo
 	return locs, chosen, nil
 }
 
-// checkMapEdge 校验一条必有或禁用道路的端点：必须引用已有地点，
-// 且不能连接同一地点。
+// checkMapEdge 校验一条必有或禁用道路的端点：必须是合法 UTF-8、引用已有
+// 地点，且不能连接同一地点。
 func checkMapEdge(e Edge, locSet map[string]struct{}, what string) error {
+	if !utf8.ValidString(e.From) {
+		return ruleErrorf("%s起点不是合法 UTF-8: %q", what, e.From)
+	}
+	if !utf8.ValidString(e.To) {
+		return ruleErrorf("%s终点不是合法 UTF-8: %q", what, e.To)
+	}
 	if _, ok := locSet[e.From]; !ok {
 		return ruleErrorf("%s引用了不存在的地点: %q", what, e.From)
 	}
