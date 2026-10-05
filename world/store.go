@@ -12,11 +12,14 @@ import (
 type RecordInfo struct {
 	// ID 是记录在存档目录内的唯一标识。
 	ID RecordID
-	// Parent 是父记录标识；直接建立的槽首条记录为空。
+	// Parent 是父记录标识。只有直接建立的槽首条记录没有父记录（为空）；
+	// 分支槽首条记录以来源槽记录为父，故槽首记录的 Parent 不一定为空。
 	Parent RecordID
-	// SlotFirst 表示这是所在槽的首条记录（根记录或分支记录）。
+	// SlotFirst 表示这是所在槽的首条记录（直接建立的根记录，或从其他
+	// 槽分出的分支首记录）；它不等价于 Parent 为空。
 	SlotFirst bool
-	// Version 是记录中世界规则的版本。
+	// Version 是记录中世界规则的版本；History 列出它不代表该版本已被
+	// 调用方接受，用 Record 读取时仍需显式给出可接受版本集合。
 	Version string
 }
 
