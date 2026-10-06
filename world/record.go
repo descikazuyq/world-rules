@@ -1,6 +1,7 @@
 package world
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -131,6 +132,12 @@ func writeRecord(slotDir string, e *envelope) error {
 // 仍通过校验和检查，文件损坏便被掩盖。因此无效字节与不成对的代理项转义
 // 必须在解析前按原始字节拒绝，整条记录视为损坏，绝不用替换字符补齐后
 // 继续交付。
+//
+// 解析后还要检查同一对象内的名称是否重复出现：encoding/json 对同名字段
+// 静默采用后一个值，只要解码后的内容与校验和匹配，一份内部自相矛盾的
+// 记录（例如先写一个负的时间片、再用同名字段写回合法值）就会被当作完好
+// 记录交付。因此同一对象内任何名称出现第二次，无论两个值是否相同、采用
+// 后一个值后的世界是否合法、校验和是否匹配，整条记录都视为损坏。
 func loadRecord(path string) (*envelope, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -148,7 +155,78 @@ func loadRecord(path string) (*envelope, error) {
 	if err := json.Unmarshal(data, &e); err != nil {
 		return nil, fmt.Errorf("记录无法解析: %w", err)
 	}
+	if err := checkDuplicateNames(data); err != nil {
+		return nil, err
+	}
 	return &e, nil
+}
+
+// checkDuplicateNames 检查 JSON 文本中同一对象内的名称是否重复出现。
+//
+// 名称按 JSON 转义还原后的字符串比较：直接写出的名称与表示同一名称的
+// Unicode 转义（如 "ID" 与写作转义形式的同一名称）视为同一名称，不能
+// 借此绕过限制。
+// 判定严格按对象边界：两个不同对象各自使用相同名称是正常的（例如两个物品
+// 条目各自有数量字段），只有同一对象内名称第二次出现才报错；字符串值中的
+// 文字与标点不算对象名称。记录文本已经通过 json.Unmarshal 解析，这里只做
+// 重复名称判定，语法问题不再出现。
+func checkDuplicateNames(data []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	// UseNumber 避免数值范围差异：这里只关心对象结构与名称，不解释数值。
+	dec.UseNumber()
+	// frame 描述解析栈中的一层容器：对象记录已见过的名称并跟踪下一个
+	// token 是否为键；数组只需占位，其中的字符串是值而不是名称。
+	type frame struct {
+		isObj     bool
+		seen      map[string]bool
+		expectKey bool
+	}
+	var stack []*frame
+	// 一个值（标量或容器）结束后，父对象等待下一个键。
+	markValueDone := func() {
+		if n := len(stack); n > 0 && stack[n-1].isObj {
+			stack[n-1].expectKey = true
+		}
+	}
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			// 文本已通过 json.Unmarshal，正常只会遇到 io.EOF；其余
+			// 情况不在这里报告。
+			return nil
+		}
+		if n := len(stack); n > 0 && stack[n-1].isObj && stack[n-1].expectKey {
+			if d, ok := tok.(json.Delim); ok && d == '}' {
+				stack = stack[:n-1]
+				continue
+			}
+			key, ok := tok.(string)
+			if !ok {
+				return nil
+			}
+			if stack[n-1].seen[key] {
+				return fmt.Errorf("同一对象内名称 %q 重复出现", key)
+			}
+			stack[n-1].seen[key] = true
+			stack[n-1].expectKey = false
+			continue
+		}
+		switch d := tok.(type) {
+		case json.Delim:
+			switch d {
+			case '{':
+				markValueDone()
+				stack = append(stack, &frame{isObj: true, seen: make(map[string]bool), expectKey: true})
+			case '[':
+				markValueDone()
+				stack = append(stack, &frame{})
+			case '}', ']':
+				stack = stack[:len(stack)-1]
+			}
+		default:
+			markValueDone()
+		}
+	}
 }
 
 // checkRecordText 校验记录文件原始字节的文本编码：JSON 文本必须是合法
