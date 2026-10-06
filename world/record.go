@@ -1,6 +1,7 @@
 package world
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -125,12 +126,24 @@ func writeRecord(slotDir string, e *envelope) error {
 
 // loadRecord 读取并解析一条记录文件，但不做校验。
 //
-// 解析前先做文本编码检查：encoding/json 会把记录中的无效 UTF-8 字节和
+// 解析前先做两项按原始字节进行的检查：
+//
+// 其一为文本编码检查：encoding/json 会把记录中的无效 UTF-8 字节和
 // 字符串值、对象键里不成对的 Unicode 代理项转义悄悄改写成替换字符“�”，
 // 随后才做内容校验——若原记录本就含有合法的“�”，改写后的文本甚至可能
 // 仍通过校验和检查，文件损坏便被掩盖。因此无效字节与不成对的代理项转义
 // 必须在解析前按原始字节拒绝，整条记录视为损坏，绝不用替换字符补齐后
 // 继续交付。
+//
+// 其二为同一对象内的名称唯一性检查：encoding/json 对同一对象中重复出现
+// 的字段名采取“后者覆盖前者”的静默策略，被覆盖掉的那个值不会留下任何
+// 痕迹，解析结果甚至可能与校验和匹配、世界状态合法，记录里却同时写着
+// 两份自相矛盾的内容（例如先写一个负时间片、再用同名字段写回合法值）。
+// 因此名称在同一对象内第二次出现时整条记录视为损坏，无论两个值是否相同、
+// 采用后值后世界是否合法、校验和是否匹配。名称按 JSON 转义还原后的字符串
+// 比较，直接写出的名称与表示同一名称的 \uXXXX 转义不能绕过该限制；
+// 两个不同对象各自使用相同名称（如两个物品条目各自的数量字段）不算重复，
+// 字符串值中的文字也不参与判断。
 func loadRecord(path string) (*envelope, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -142,6 +155,9 @@ func loadRecord(path string) (*envelope, error) {
 		return nil, err
 	}
 	if err := checkRecordText(data); err != nil {
+		return nil, err
+	}
+	if err := checkDuplicateObjectNames(data); err != nil {
 		return nil, err
 	}
 	var e envelope
@@ -212,6 +228,71 @@ func checkRecordText(data []byte) error {
 			case v >= 0xDC00 && v <= 0xDFFF:
 				return fmt.Errorf("记录包含单独出现的低位代理项转义 \\u%04X，Unicode 转义损坏", v)
 			}
+		}
+	}
+	return nil
+}
+
+// checkDuplicateObjectNames 以流式 token 方式扫描记录的 JSON 结构：同一个
+// 对象内同一名称第二次出现即判损坏，无论两个值是否相同。json.Decoder 给出
+// 的键名已按 JSON 规则还原转义（\uXXXX 与代理项对都解码为 Go 字符串），
+// 且不会像反序列化那样用后值静默覆盖前值，因此直接写出的名称与表示同一
+// 名称的 Unicode 转义会被识别为同名；两个不同对象（含数组中各自的元素
+// 对象，例如两个物品条目各自的数量字段）独立计数，字符串值中的文字不参与
+// 判断。
+//
+// 扫描只负责发现重复名称：记录的其它结构合法性仍由随后的 json.Unmarshal
+// 判定，解析失败同样按损坏拒绝。调用前记录已通过 checkRecordText，是合法
+// UTF-8 且无不成对的代理项转义，故解码出的键名即名称的真实内容。
+func checkDuplicateObjectNames(data []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	return checkDuplicateNamesValue(dec)
+}
+
+// checkDuplicateNamesValue 消费一个 JSON 值的全部 token；对象与数组递归
+// 下降，对象内按还原后的名称查重。
+func checkDuplicateNamesValue(dec *json.Decoder) error {
+	tok, err := dec.Token()
+	if err != nil {
+		// 结构非法（截断、非法标记等）交由随后的 json.Unmarshal 报错；
+		// 这里结束扫描即可，已检出的重复名称会先行返回。
+		return nil
+	}
+	delim, ok := tok.(json.Delim)
+	if !ok {
+		return nil // 标量值
+	}
+	switch delim {
+	case '{':
+		keys := make(map[string]struct{})
+		for dec.More() {
+			kt, err := dec.Token()
+			if err != nil {
+				return nil // 解析错误留给 json.Unmarshal
+			}
+			name, _ := kt.(string)
+			if _, dup := keys[name]; dup {
+				return fmt.Errorf("记录在同一对象内重复出现名称 %q，名称重复的记录视为损坏", name)
+			}
+			keys[name] = struct{}{}
+			// 消费与该键对应的值（可能本身是对象或数组）。
+			if err := checkDuplicateNamesValue(dec); err != nil {
+				return err
+			}
+		}
+		// 消费闭合的 '}'。
+		if _, err := dec.Token(); err != nil {
+			return nil
+		}
+	case '[':
+		// 数组不持有名称集合：每个元素各自递归，元素之间同名不冲突。
+		for dec.More() {
+			if err := checkDuplicateNamesValue(dec); err != nil {
+				return err
+			}
+		}
+		if _, err := dec.Token(); err != nil {
+			return nil
 		}
 	}
 	return nil

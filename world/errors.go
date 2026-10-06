@@ -37,7 +37,7 @@ func (e *NotFoundError) Error() string {
 }
 
 // CorruptError 表示记录内容损坏：校验和不符、父记录链断裂、
-// 数据无法解析等。
+// 数据无法解析、同一对象内名称重复等。
 type CorruptError struct {
 	Slot   string
 	Record RecordID
