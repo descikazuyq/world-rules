@@ -5,10 +5,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"unicode/utf8"
 )
 
 // RecordID 是一次成功保存产生的、在同一存档目录内唯一的记录标识。
@@ -122,6 +124,12 @@ func writeRecord(slotDir string, e *envelope) error {
 }
 
 // loadRecord 读取并解析一条记录文件，但不做校验。
+//
+// 解析前先按原始字节检查文本完整性：encoding/json 会把记录文件中的无效
+// UTF-8 字节和字符串值、对象键里不成对的 Unicode 代理项转义悄悄改写成
+// 替换字符“�”后再交付；若原记录本就含有合法的“�”，改写后的文本甚至可能
+// 仍通过内容校验和检查，文件损坏便被掩盖。因此这两类情况在此即视为损坏，
+// 绝不用替换字符补齐后继续解析。
 func loadRecord(path string) (*envelope, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -132,11 +140,99 @@ func loadRecord(path string) (*envelope, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := checkRecordText(data); err != nil {
+		return nil, err
+	}
 	var e envelope
 	if err := json.Unmarshal(data, &e); err != nil {
 		return nil, fmt.Errorf("记录无法解析: %w", err)
 	}
 	return &e, nil
+}
+
+// checkRecordText 按原始字节检查记录文件的文本完整性：整个文件必须是合法
+// UTF-8，且 JSON 字符串中不得出现不成对的 Unicode 代理项转义。
+func checkRecordText(data []byte) error {
+	if !utf8.Valid(data) {
+		return errors.New("记录文本编码损坏: 包含无效 UTF-8 字节")
+	}
+	return checkSurrogateEscapes(data)
+}
+
+// checkSurrogateEscapes 扫描 JSON 文本中的字符串（值与对象键），拒绝不成对
+// 的 Unicode 代理项转义：高位代理项（D800–DBFF）未紧接合法的低位代理项
+// （DC00–DFFF）转义，或低位代理项单独出现，均属损坏。已经转义的反斜杠
+// （\\）之后跟的 uD800 只是普通文字，不算转义序列，不能误判。
+func checkSurrogateEscapes(data []byte) error {
+	inString := false
+	for i := 0; i < len(data); i++ {
+		c := data[i]
+		if !inString {
+			if c == '"' {
+				inString = true
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inString = false
+		case '\\':
+			if i+1 >= len(data) {
+				// 截断的转义序列由 JSON 解析报错。
+				return nil
+			}
+			if data[i+1] != 'u' {
+				// 普通转义（含 \\）：跳过被转义的字符即可。
+				i++
+				continue
+			}
+			if i+6 > len(data) {
+				return nil
+			}
+			cp, ok := parseHex4(data[i+2 : i+6])
+			if !ok {
+				// 非法的 \u 转义由 JSON 解析报错。
+				i++
+				continue
+			}
+			switch {
+			case cp >= 0xD800 && cp <= 0xDBFF:
+				// 高位代理项必须紧接一个合法的低位代理项转义。
+				if i+12 <= len(data) && data[i+6] == '\\' && data[i+7] == 'u' {
+					if lo, ok := parseHex4(data[i+8 : i+12]); ok && lo >= 0xDC00 && lo <= 0xDFFF {
+						i += 11
+						continue
+					}
+				}
+				return fmt.Errorf("记录文本损坏: Unicode 高位代理项转义\\u%04X 后未紧跟合法低位代理项", cp)
+			case cp >= 0xDC00 && cp <= 0xDFFF:
+				return fmt.Errorf("记录文本损坏: Unicode 低位代理项转义\\u%04X 单独出现", cp)
+			default:
+				i += 5
+			}
+		}
+	}
+	return nil
+}
+
+// parseHex4 解析恰好 4 位十六进制数字。
+func parseHex4(b []byte) (int, bool) {
+	v := 0
+	for _, c := range b {
+		var d int
+		switch {
+		case c >= '0' && c <= '9':
+			d = int(c - '0')
+		case c >= 'a' && c <= 'f':
+			d = int(c-'a') + 10
+		case c >= 'A' && c <= 'F':
+			d = int(c-'A') + 10
+		default:
+			return 0, false
+		}
+		v = v*16 + d
+	}
+	return v, true
 }
 
 func syncDir(dir string) error {
