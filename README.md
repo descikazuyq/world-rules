@@ -339,6 +339,259 @@ func main() {
 }
 ```
 
+## 一次提交中多次增减同一种物品
+
+`Commit.ItemChanges` 允许在**同一次提交**里给同一角色的同一种物品列出
+多条增减。最终数量不是按条目次序逐条落盘，而是把**原有数量与本次全部增减
+合并**后一次性判断：
+
+- 判断依据只有“原有数量 + 本次全部 Delta 的精确和”，**增减条目的先后
+  次序不影响成败与最终数量**；所有加减用精确整数完成，不回绕。
+- 合并过程中**暂时为负、或暂时超出 int 范围都不失败**——世界上不会出现
+  一个可被读取的“负数量中间态”，校验只针对合并后的最终数量。
+- **最终数量必须是 int 可表示的非负整数**：为负或大于 int 最大值时，整次
+  提交返回 `*RuleError`。
+- 携带上限按**本次全部变化完成后的真实总量**判断：真实总量**等于上限允许，
+  大于上限拒绝**（未给该角色设置上限时不检查总量）。
+- 引用**不存在的角色**或**规则不允许的物品**，即使同次提交里正负变化互相
+  抵消为 0，仍会使整次提交失败。
+- 移动、物品变化与时间推进同属一个原子提交：任一项违规，三者一起回滚，
+  世界保持提交前状态。`Commit.Time` 是**目标绝对时间片**（不是增加的
+  步数），不能早于世界当前时间片。
+
+### 多条增减一起提交：先减后增
+
+角色 `hero` 初始在 `village`、持有 1 件 `wood`，时间片为 0；规则允许
+`village` 与 `forest` 之间有一条道路，携带上限为 4。同一个 Commit 里给
+`wood` 列出 `-2`、`+5` 两条变化，同时沿道路移动到 `forest` 并把时间片
+推进到 2：
+
+- 最终数量按 `1 - 2 + 5 = 4` 判断。`-2` 虽然排在前面，合并途中的 -1
+  只存在于计算里，**不会产生一个数量为 -1 的可读世界**。
+- 最终 4 件恰好等于上限 4，允许；真实总量大于上限才拒绝。
+- 成功后角色在 `forest`、`wood=4`、时间片为 2。
+
+交换这两条增减的次序（`+5`、`-2`）再从相同初始状态提交，结果完全相同——
+判断依据是原有数量与本次全部增减合并后的结果，与条目次序无关。
+
+### 只提交减少：规则错误与回滚
+
+从相同初始状态只提交减少 2 件（仍带上同样合法的移动和时间目标）：最终
+数量 `1 - 2 = -1`，提交返回 `*RuleError`（可用 `errors.As` 判断），
+**角色位置、物品数量和时间片全部保持提交前状态**：角色仍在 `village`、
+`wood=1`、时间片仍为 0，移动与时间推进一并撤销。
+
+### 拆成两次 Apply 不能拼成一次成功提交
+
+若把原先的 `-2`、`+5` 拆成两次 `Apply`：**第一步**（`wood -2`）就因最终
+数量为负而失败，世界原样不动；之后的 `+5` 属于**另一次独立提交**，它只能
+在当时的实际数量（1 件）上生效，既不能回头把第一次变成成功提交，也拼不出
+原先那次“移动到 `forest`、净 +3 到 4 件”的原子结果。多条增减必须放进同一
+个 Commit，才按合并后的最终数量判断。
+
+### 成功只改内存，写回仍走已有保存入口
+
+下面的示例只操作内存世界。`Apply` 成功不会触碰任何存档；要把结果写回槽，
+仍按上文“读档后继续同一存档槽”使用已有的保存入口（首次 `Save`、继续用
+`Replace(slot, world, recordID)`），历史浏览等说明也保持不变。
+
+### 完整示例
+
+下面的程序可直接阅读使用（可运行版本在
+`world/example_item_changes_test.go`，`go test ./...` 会校验其输出）：从
+持有一件木材的初始世界出发，演示先减后增、交换次序、只减失败、拆开两次
+提交的对照，以及数量范围、携带上限与未知角色/物品的边界，输出直接显示
+数量、位置和时间的变化。
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+	"log"
+	"math"
+
+	"github.com/descikazuyq/world-rules/world"
+)
+
+// woodWorld 建立示例共用的初始世界：时间片 0，hero 在 village、持有 1 件
+// wood；village 与 forest 之间有道路，hero 的携带总量上限由 limit 给出。
+func woodWorld(limit int) *world.World {
+	w, err := world.NewWorld(world.InitialData{
+		Seed: 20240802,
+		Rules: world.Rules{
+			Version:     "v1",
+			Locations:   []string{"village", "forest"},
+			Edges:       []world.Edge{{From: "village", To: "forest"}},
+			ItemKinds:   []string{"wood"},
+			CarryLimits: map[string]int{"hero": limit},
+		},
+		Characters: []world.Character{{
+			ID:       "hero",
+			Location: "village",
+			Items:    []world.CharacterItem{{Item: "wood", Count: 1}},
+		}},
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	return w
+}
+
+func printState(tag string, w *world.World) {
+	s := w.Snapshot()
+	c := s.Characters[0]
+	fmt.Printf("%s: time=%d %s@%s wood=%d\n", tag, s.Time, c.ID, c.Location, c.Items[0].Count)
+}
+
+func printRuleError(tag string, err error) {
+	var re *world.RuleError
+	fmt.Printf("%s: %v 类型=*world.RuleError:%t\n", tag, err, errors.As(err, &re))
+}
+
+func main() {
+	// 一、同一次提交先减 2 再增 5，同时沿 village-forest 移动、时间 0->2。
+	// 最终数量按 1 - 2 + 5 = 4 判断；-2 排在前面也不会产生可读的负数量。
+	w := woodWorld(4)
+	printState("提交前", w)
+	if _, err := w.Apply(world.Commit{
+		Moves: []world.Move{{Character: "hero", To: "forest"}},
+		ItemChanges: []world.ItemChange{
+			{Character: "hero", Item: "wood", Delta: -2},
+			{Character: "hero", Item: "wood", Delta: 5},
+		},
+		Time: 2, // 目标绝对时间片：0 -> 2
+	}); err != nil {
+		log.Fatal(err)
+	}
+	printState("先减后增", w)
+	// 提交前: time=0 hero@village wood=1
+	// 先减后增: time=2 hero@forest wood=4
+
+	// Commit.Time 是目标绝对时间片：当前已是 2，目标 1 属于时间倒退。
+	_, err := w.Apply(world.Commit{Time: 1})
+	printRuleError("时间倒退", err)
+	// 时间倒退: world: 时间不能倒退: 当前 2, 提交目标 1 类型=*world.RuleError:true
+
+	// 二、交换两条增减的次序：合并结果相同，成功结果完全相同。
+	w2 := woodWorld(4)
+	if _, err := w2.Apply(world.Commit{
+		Moves: []world.Move{{Character: "hero", To: "forest"}},
+		ItemChanges: []world.ItemChange{
+			{Character: "hero", Item: "wood", Delta: 5},
+			{Character: "hero", Item: "wood", Delta: -2},
+		},
+		Time: 2,
+	}); err != nil {
+		log.Fatal(err)
+	}
+	printState("先增后减", w2)
+	// 先增后减: time=2 hero@forest wood=4
+
+	// 三、只提交减少 2（移动与时间目标仍合法）：最终 -1，整次提交失败，
+	// 移动与时间一起回滚，世界保持提交前状态。
+	w3 := woodWorld(4)
+	_, err = w3.Apply(world.Commit{
+		Moves:       []world.Move{{Character: "hero", To: "forest"}},
+		ItemChanges: []world.ItemChange{{Character: "hero", Item: "wood", Delta: -2}},
+		Time:        2,
+	})
+	printRuleError("只减两件", err)
+	printState("失败后", w3)
+	// 只减两件: world: 角色 "hero" 的物品 "wood" 数量不能为负: -1 类型=*world.RuleError:true
+	// 失败后: time=0 hero@village wood=1
+
+	// 四、拆成两次 Apply（上限放到 6 以便看清第二次落点）：第一步失败后
+	// 世界原样不动；之后的 +5 是另一次独立提交（1 -> 6），无法把第一次
+	// 变成成功提交，也拼不出“到 forest、到 4 件”的原子结果。
+	w4 := woodWorld(6)
+	_, err = w4.Apply(world.Commit{
+		Moves:       []world.Move{{Character: "hero", To: "forest"}},
+		ItemChanges: []world.ItemChange{{Character: "hero", Item: "wood", Delta: -2}},
+		Time:        2,
+	})
+	printRuleError("拆开第一步", err)
+	printState("第一步失败后", w4)
+	if _, err := w4.Apply(world.Commit{
+		ItemChanges: []world.ItemChange{{Character: "hero", Item: "wood", Delta: 5}},
+		Time:        2,
+	}); err != nil {
+		log.Fatal(err)
+	}
+	printState("另一次提交+5", w4)
+	// 拆开第一步: world: 角色 "hero" 的物品 "wood" 数量不能为负: -1 类型=*world.RuleError:true
+	// 第一步失败后: time=0 hero@village wood=1
+	// 另一次提交+5: time=2 hero@village wood=6
+
+	// 五、数量范围：中途暂时超出 int 不失败：
+	// 1 + MaxInt - (MaxInt-3) = 4，最终合法即成功。
+	w5 := woodWorld(4)
+	if _, err := w5.Apply(world.Commit{
+		ItemChanges: []world.ItemChange{
+			{Character: "hero", Item: "wood", Delta: math.MaxInt},
+			{Character: "hero", Item: "wood", Delta: -(math.MaxInt - 3)},
+		},
+		Time: 1,
+	}); err != nil {
+		log.Fatal(err)
+	}
+	printState("中途超出int", w5)
+	// 中途超出int: time=1 hero@village wood=4
+
+	// 最终数量超出 int（1 + MaxInt）则拒绝，世界保持提交前状态。
+	w6 := woodWorld(4)
+	_, err = w6.Apply(world.Commit{
+		ItemChanges: []world.ItemChange{{Character: "hero", Item: "wood", Delta: math.MaxInt}},
+		Time:        1,
+	})
+	printRuleError("最终超出int", err)
+	printState("溢出失败后", w6)
+	// 最终超出int: world: 角色 "hero" 的物品 "wood" 数量超出整数范围: 9223372036854775808 类型=*world.RuleError:true
+	// 溢出失败后: time=0 hero@village wood=1
+
+	// 六、携带上限按变化完成后的真实总量判断：上面最终 4 件、上限 4（等于
+	// 上限）允许；把上限改成 3，真实总量 4 大于上限，整次提交失败。
+	w7 := woodWorld(3)
+	_, err = w7.Apply(world.Commit{
+		Moves: []world.Move{{Character: "hero", To: "forest"}},
+		ItemChanges: []world.ItemChange{
+			{Character: "hero", Item: "wood", Delta: -2},
+			{Character: "hero", Item: "wood", Delta: 5},
+		},
+		Time: 2,
+	})
+	printRuleError("大于上限", err)
+	printState("超限失败后", w7)
+	// 大于上限: world: 角色 "hero" 携带总量 4 超过上限 3 类型=*world.RuleError:true
+	// 超限失败后: time=0 hero@village wood=1
+
+	// 七、不存在的角色或规则不允许的物品，即使正负变化互相抵消为 0，整次
+	// 提交仍失败。
+	w8 := woodWorld(4)
+	_, err = w8.Apply(world.Commit{
+		ItemChanges: []world.ItemChange{
+			{Character: "ghost", Item: "wood", Delta: 5},
+			{Character: "ghost", Item: "wood", Delta: -5},
+		},
+		Time: 1,
+	})
+	printRuleError("未知角色", err)
+	_, err = w8.Apply(world.Commit{
+		ItemChanges: []world.ItemChange{
+			{Character: "hero", Item: "gem", Delta: 5},
+			{Character: "hero", Item: "gem", Delta: -5},
+		},
+		Time: 1,
+	})
+	printRuleError("不允许的物品", err)
+	printState("抵消失败后", w8)
+	// 未知角色: world: 物品变化引用了不存在的角色: "ghost" 类型=*world.RuleError:true
+	// 不允许的物品: world: 角色 "hero" 的物品变化引用了规则不允许的物品: "gem" 类型=*world.RuleError:true
+	// 抵消失败后: time=0 hero@village wood=1
+}
+```
+
 ## 浏览一个槽已保存的历史
 
 前面的读档说明都假设已经知道要读哪份记录（槽当前记录，或某个已知
