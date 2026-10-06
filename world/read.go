@@ -35,8 +35,14 @@ func acquireSharedLock(dir string) (*fileLock, error) {
 	return &fileLock{f: f}, nil
 }
 
-// loadAndVerifyLocked 读取记录文件，校验其记录格式版本、内容校验和（校验和
+// loadAndVerifyLocked 读取记录文件，校验其文本编码（无效 UTF-8 字节与
+// 不成对的 Unicode 代理项转义一律损坏）、记录格式版本、内容校验和（校验和
 // 已包含父记录关系）、父记录是否存在，以及世界数据是否自洽。
+//
+// 文本编码检查在解析前按原始字节进行：encoding/json 会把无效字节与不成对
+// 的代理项转义悄悄改写成替换字符“�”，若原记录本就含有合法的“�”，改写后
+// 的文本甚至可能仍通过校验和检查，因此这类记录即使替换后的世界状态合法、
+// 校验和匹配、规则版本也被接受，仍按损坏拒绝，绝不用替换字符补齐后交付。
 //
 // 记录格式只支持 recordFormatVersion：格式编号缺失、为零、为负或为其他
 // 正整数的记录按损坏处理，即使校验和匹配、世界状态合法、规则版本可被
@@ -110,9 +116,10 @@ func envToRecord(env *envelope) Record {
 // Latest 读取槽当前最新记录。
 //
 // acceptedVersions 是调用方明确给出的可接受规则版本集合：记录完好但
-// 版本不在集合内时返回 *VersionRejectedError；记录损坏（格式版本不受支持、
-// 校验和不符、父记录缺失、无法解析、时间片为负）时返回 *CorruptError。
-// 格式与版本分别判断：格式不受支持的记录一律报损坏，不报版本拒绝。
+// 版本不在集合内时返回 *VersionRejectedError；记录损坏（文本编码或
+// Unicode 转义损坏、格式版本不受支持、校验和不符、父记录缺失、无法解析、
+// 时间片为负）时返回 *CorruptError。文本损坏与格式问题都先于版本判断：
+// 即使版本不被接受，损坏的记录也报损坏而不报版本拒绝。
 // 读取不会改写存档。
 func (a *Archive) Latest(slot string, acceptedVersions []string) (Record, error) {
 	if !validSlotName(slot) {
