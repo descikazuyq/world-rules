@@ -89,6 +89,21 @@ func TestLatestAndRecordDuplicateNameCorrupt(t *testing.T) {
 		{"Unicode转义同名", `"ID": "hero",`, `"\u0049D": "hero", "ID": "hero",`},
 		// 转义写在前：先以转义形式给出同一名称，再直接写出。
 		{"Unicode转义同名在前", `"ID": "hero",`, `"ID": "hero", "\u0049D": "hero",`},
+		// 仅大小写不同的两个名称也会写入同一个固定字段，后一个值不能遮住
+		// 前一个值——本次修复的核心情形。
+		{"时间片大小写", `"Time": 1,`, `"Time": -5, "time": 1,`},
+		// 小写写在前、大写写在后；两个值完全相同也算重复。
+		{"时间片小写在前同值", `"Time": 1,`, `"time": 1, "Time": 1,`},
+		// 信封字段（JSON 标签为小写）换成大写仍是同一字段。
+		{"信封格式大小写", `"format": 1,`, `"format": 1, "FORMAT": 1,`},
+		{"信封格式大写在前", `"format": 1,`, `"FORMAT": 1, "format": 1,`},
+		// 规则、道路、角色、物品条目里的字段同样按忽略大小写归并。
+		{"规则版本大小写", `"Version": "v1",`, `"VERSION": "v9", "Version": "v1",`},
+		{"道路端点大小写", `"From": "hall",`, `"from": "void", "From": "hall",`},
+		{"角色标识大小写", `"ID": "hero",`, `"id": "ghost", "ID": "hero",`},
+		{"物品数量大小写", `"Count": 1`, `"count": -9, "Count": 1`},
+		// 直接写法与 Unicode 转义写法在大小写维度上仍然相撞。
+		{"大小写混合转义", `"Time": 1,`, `"Time": -5, "time": 1,`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

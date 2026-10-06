@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"unicode/utf8"
 )
 
@@ -133,11 +134,13 @@ func writeRecord(slotDir string, e *envelope) error {
 // 必须在解析前按原始字节拒绝，整条记录视为损坏，绝不用替换字符补齐后
 // 继续交付。
 //
-// 解析后还要检查同一对象内的名称是否重复出现：encoding/json 对同名字段
-// 静默采用后一个值，只要解码后的内容与校验和匹配，一份内部自相矛盾的
-// 记录（例如先写一个负的时间片、再用同名字段写回合法值）就会被当作完好
-// 记录交付。因此同一对象内任何名称出现第二次，无论两个值是否相同、采用
-// 后一个值后的世界是否合法、校验和是否匹配，整条记录都视为损坏。
+// 解析后还要检查同一对象内是否有重复字段：encoding/json 对同名键静默采用
+// 后一个值，而且结构体字段匹配本身忽略大小写——先写 "Time": -1 再写
+// "time": 0，两个键都会写入同一个固定字段，只要解码后的内容与校验和匹配，
+// 一份内部自相矛盾的记录就会被当作完好记录交付。因此同一对象内只要两个
+// 名称会被读取为同一个固定字段（拼写相同，或仅大小写/Unicode 转义写法
+// 不同），无论两个值是否相同、采用后一个值后的世界是否合法、校验和是否
+// 匹配，整条记录都视为损坏。
 func loadRecord(path string) (*envelope, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -161,69 +164,189 @@ func loadRecord(path string) (*envelope, error) {
 	return &e, nil
 }
 
-// checkDuplicateNames 检查 JSON 文本中同一对象内的名称是否重复出现。
+// checkDuplicateNames 检查 JSON 文本中同一对象内是否有重复字段。
+//
+// 判定标准与记录解码完全一致：两个名称是否会被读取为同一个固定字段。
+// 编码格式与各层级的固定字段（含大小写忽略的 Go 名称和 JSON 标签）固定
+// 且互不相同，检查器据此沿对象栈定位当前对象的固定字段集合：
+//
+//   - 结构体型对象中，键按名称还原后忽略大小写归并（复刻 encoding/json
+//     对无标签导出字段的匹配：先精确匹配，再按 foldName 匹配；本记录格式
+//     没有在忽略大小写后互相冲突的固定字段）。因此 "Time" 与 "time"、
+//     "time" 与 "Time" 都写入同一字段，同一对象内第二次出现即重复。
+//   - 携带上限（CarryLimits）是名称到数值的映射而不是结构体：其键是实际
+//     角色标识，"hero" 与 "HERO" 是两个不同角色，必须各自保留，绝不按
+//     大小写合并或误报；判定与 map 解码一样按还原后的精确字符串比较。
 //
 // 名称按 JSON 转义还原后的字符串比较：直接写出的名称与表示同一名称的
-// Unicode 转义（如 "ID" 与写作转义形式的同一名称）视为同一名称，不能
-// 借此绕过限制。
-// 判定严格按对象边界：两个不同对象各自使用相同名称是正常的（例如两个物品
-// 条目各自有数量字段），只有同一对象内名称第二次出现才报错；字符串值中的
-// 文字与标点不算对象名称。记录文本已经通过 json.Unmarshal 解析，这里只做
-// 重复名称判定，语法问题不再出现。
+// Unicode 转义（如 "Time" 与 "time"）视为同一名称，不能借转义
+// 绕过限制。判定严格按对象边界：两个不同对象各自使用相同名称是正常的
+// （例如两个物品条目各自有数量字段），只有同一对象内一个固定字段被提供
+// 两次才报错；字符串值中的文字与标点不算对象名称。记录文本已经通过
+// json.Unmarshal 解析，这里只做重复字段判定，语法问题不再出现。
+//
+// 不映射到任何固定字段的未知键在读取时被忽略；它们彼此完全同名仍沿用既有
+// 的同名重复拒绝，但大小写不同的未知键不会被误报，也不可能遮住固定字段。
 func checkDuplicateNames(data []byte) error {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	// UseNumber 避免数值范围差异：这里只关心对象结构与名称，不解释数值。
 	dec.UseNumber()
-	// frame 描述解析栈中的一层容器：对象记录已见过的名称并跟踪下一个
-	// token 是否为键；数组只需占位，其中的字符串是值而不是名称。
+	// kind 描述解析栈中一层容器的类型。
+	type kind int
+	const (
+		kIgnore    kind = iota // 不对应固定结构的对象（防御性，正常记录不出现）
+		kArray                 // 数组：只占位，其中的字符串是值而不是名称
+		kEnvelope              // 记录信封
+		kState                 // 世界状态
+		kRules                 // 规则
+		kEdge                  // 道路条目
+		kCharacter             // 角色条目
+		kItem                  // 物品条目
+		kStringMap             // 携带上限 map：键是实际角色标识
+	)
+	isObject := func(k kind) bool { return k != kArray }
+	// fixedFields 给出每种结构体型对象的固定字段，键为复刻 encoding/json
+	// foldName 的折叠名称；与 types.go 的结构体定义及 envelope 的 JSON 标签
+	// 一一对应。这些固定字段折叠后互不相同，因此忽略大小写不会让两个不同
+	// 的固定字段撞在一起。
+	fixedFields := map[kind]map[string]bool{
+		kEnvelope: {"FORMAT": true, "ID": true, "PARENT": true, "SLOTFIRST": true,
+			"CHECKSUM": true, "STATE": true},
+		kState: {"SEED": true, "RULES": true, "TIME": true, "CHARACTERS": true},
+		kRules: {"VERSION": true, "LOCATIONS": true, "EDGES": true,
+			"ITEMKINDS": true, "CARRYLIMITS": true},
+		kEdge:      {"FROM": true, "TO": true},
+		kCharacter: {"ID": true, "LOCATION": true, "ITEMS": true},
+		kItem:      {"ITEM": true, "COUNT": true},
+	}
+	// childSpec 描述某固定字段的值是哪种容器：obj 为对象类型，arr 为数组
+	// 时其元素对象的类型（kIgnore 表示标量数组）。
+	type childSpec struct {
+		obj kind
+		arr kind
+	}
+	fieldSpecs := map[kind]map[string]childSpec{
+		kEnvelope: {"STATE": {obj: kState}},
+		kState:    {"RULES": {obj: kRules}, "CHARACTERS": {arr: kCharacter}},
+		kRules: {
+			"LOCATIONS":   {arr: kIgnore},
+			"EDGES":       {arr: kEdge},
+			"ITEMKINDS":   {arr: kIgnore},
+			"CARRYLIMITS": {obj: kStringMap},
+		},
+		kCharacter: {"ITEMS": {arr: kItem}},
+	}
+	// frame 是解析栈中的一层容器。
 	type frame struct {
-		isObj     bool
-		seen      map[string]bool
+		k         kind
+		seen      map[string]bool // 已提供的固定字段（规范名）或 map 键（精确名）
+		seenRaw   map[string]bool // 已出现的键的精确名（保留对未知键同名重复的拒绝）
 		expectKey bool
+		pending   childSpec // 最近一个键对应值的容器描述，仅下一个值有效
+		elem      kind      // 仅数组帧：其元素对象的类型
 	}
 	var stack []*frame
-	// 一个值（标量或容器）结束后，父对象等待下一个键。
+	// canonicalField 返回 key 在该结构体对象中会被读入的固定字段规范名
+	// （大写名称）；不属于任何固定字段时返回空。判定复刻 encoding/json：
+	// 先按精确名匹配、再忽略大小写匹配（与 strings.EqualFold 同语义，也
+	// 覆盖 Unicode 转义还原后的名称）。本格式的固定字段折叠后互不相同。
+	canonicalField := func(k kind, key string) string {
+		for f := range fixedFields[k] {
+			if strings.EqualFold(f, key) {
+				return f
+			}
+		}
+		return ""
+	}
+	// 一个值（标量或容器）结束后，父对象等待下一个键；数组帧不等待键。
 	markValueDone := func() {
-		if n := len(stack); n > 0 && stack[n-1].isObj {
+		if n := len(stack); n > 0 && isObject(stack[n-1].k) {
 			stack[n-1].expectKey = true
 		}
 	}
 	for {
 		tok, err := dec.Token()
 		if err != nil {
-			// 文本已通过 json.Unmarshal，正常只会遇到 io.EOF；其余
-			// 情况不在这里报告。
+			// 文本已通过 json.Unmarshal，正常只会遇到 io.EOF；其余情况
+			// 不在这里报告。
 			return nil
 		}
-		if n := len(stack); n > 0 && stack[n-1].isObj && stack[n-1].expectKey {
+		if n := len(stack); n > 0 && isObject(stack[n-1].k) && stack[n-1].expectKey {
+			top := stack[n-1]
 			if d, ok := tok.(json.Delim); ok && d == '}' {
 				stack = stack[:n-1]
+				markValueDone()
 				continue
 			}
 			key, ok := tok.(string)
 			if !ok {
 				return nil
 			}
-			if stack[n-1].seen[key] {
-				return fmt.Errorf("同一对象内名称 %q 重复出现", key)
+			if top.k == kStringMap {
+				// map 的键是实际角色标识：按还原后的精确字符串区分，
+				// hero 与 HERO 是两个角色；只有完全相同的键才算重复。
+				if top.seen[key] {
+					return fmt.Errorf("同一对象内名称 %q 重复出现", key)
+				}
+				top.seen[key] = true
+			} else {
+				// 未知键（读取时忽略）沿用原有同名重复拒绝；不同大小写的
+				// 未知键不映射到任何固定字段，不视为重复。
+				if top.seenRaw[key] {
+					return fmt.Errorf("同一对象内名称 %q 重复出现", key)
+				}
+				top.seenRaw[key] = true
+				name := canonicalField(top.k, key)
+				if name != "" {
+					// 两个键会被读入同一个固定字段（拼写相同，或仅大小写/
+					// Unicode 转义写法不同）即重复；后一个值不能遮住前一个。
+					if top.seen[name] {
+						return fmt.Errorf("同一对象内固定字段 %q 重复出现（字段名称忽略大小写与 Unicode 转义写法）", key)
+					}
+					top.seen[name] = true
+				}
+				top.pending = fieldSpecs[top.k][name]
 			}
-			stack[n-1].seen[key] = true
-			stack[n-1].expectKey = false
+			top.expectKey = false
 			continue
 		}
 		switch d := tok.(type) {
 		case json.Delim:
 			switch d {
 			case '{':
-				markValueDone()
-				stack = append(stack, &frame{isObj: true, seen: make(map[string]bool), expectKey: true})
+				var nk kind
+				if len(stack) == 0 {
+					nk = kEnvelope // 根对象是记录信封
+				} else if top := stack[len(stack)-1]; top.k == kArray {
+					nk = top.elem
+				} else {
+					nk = stack[len(stack)-1].pending.obj
+					stack[len(stack)-1].pending = childSpec{}
+				}
+				fr := &frame{k: nk, expectKey: true}
+				if isObject(nk) {
+					fr.seen = make(map[string]bool)
+					if nk != kStringMap {
+						fr.seenRaw = make(map[string]bool)
+					}
+				}
+				stack = append(stack, fr)
 			case '[':
-				markValueDone()
-				stack = append(stack, &frame{})
+				elem := kIgnore
+				if n := len(stack); n > 0 && isObject(stack[n-1].k) {
+					elem = stack[n-1].pending.arr
+					stack[n-1].pending = childSpec{}
+				}
+				stack = append(stack, &frame{k: kArray, elem: elem})
 			case '}', ']':
 				stack = stack[:len(stack)-1]
+				markValueDone()
 			}
 		default:
+			// 标量值：消费掉键上记录的容器描述，父对象继续等待下一个键。
+			if n := len(stack); n > 0 && isObject(stack[n-1].k) {
+				stack[n-1].pending = childSpec{}
+			}
 			markValueDone()
 		}
 	}
