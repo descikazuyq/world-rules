@@ -220,7 +220,7 @@ func (a *Archive) migrationComputeLocked(slot string, acceptedVersions []string,
 // 必须存在于旧规则、目标必须存在于新规则（即使没有角色使用也要检查），
 // 空目标或未知名称返回规则错误；合并数量或携带总量超出 int 范围返回规则
 // 错误。来源缺失、损坏或版本不被接受时沿用已有对应错误，不自动挑选历史
-// 记录。槽指针无法解析，或顶层 latest/history 字段重复（含义有歧义）时
+// 记录。槽指针无法解析、文本编码或 Unicode 转义损坏，或顶层 latest/history 字段重复（含义有歧义）时
 // 返回带槽名的 *CorruptError，先于来源与版本判断，不返回任何预览内容。
 func (a *Archive) PreviewMigration(slot string, acceptedVersions []string, target Rules, locations, items []NameMapping) (MigrationPreview, error) {
 	if !validSlotName(slot) {
@@ -250,7 +250,7 @@ func (a *Archive) PreviewMigration(slot string, acceptedVersions []string, targe
 //
 //   - source 为空，或槽已不再指向该来源（被并发覆盖、升级、确认恢复或
 //     另一次迁移抢先提交），返回 *ConflictError。
-//   - 槽指针无法解析，或顶层 latest/history 字段重复（含义有歧义）时，
+//   - 槽指针无法解析、文本编码或 Unicode 转义损坏，或顶层 latest/history 字段重复（含义有歧义）时，
 //     返回带槽名的 *CorruptError：无法确定当前来源与待承接历史，不产生
 //     新记录，不修补指针。
 //   - 来源缺失、损坏或版本不被接受分别返回已有的不存在、损坏或版本拒绝

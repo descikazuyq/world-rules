@@ -26,7 +26,7 @@ type RecoveryPreview struct {
 // 格式版本不受支持、校验失败与版本不被接受的记录；分支只在分支自身的
 // 历史中选择，不跨入来源槽。当前记录本就完好且版本可接受时可以选中它本身。
 //
-// 槽不存在返回 *NotFoundError；槽指针无法解析，或顶层 latest/history
+// 槽不存在返回 *NotFoundError；槽指针无法解析、文本编码或 Unicode 转义损坏，或顶层 latest/history
 // 字段重复（含义有歧义）时，返回带槽名的 *CorruptError，不返回当前标识或
 // 恢复来源，也不按任意一份历史继续查找。指针本身可读、只是其指向的当前
 // 记录已损坏或被删除时不属于这种情况：预览仍返回该当前标识用于之后确认；
@@ -82,7 +82,7 @@ func (a *Archive) previewRecoveryLocked(slot string, acceptedVersions []string) 
 //     或另一次恢复抢先提交），返回 *ConflictError。比较只针对槽所指记录，
 //     即使它已损坏或被删除也不例外，因此损坏/删除的当前标识不会妨碍从
 //     本槽完好旧记录恢复。
-//   - 槽指针无法解析，或顶层 latest/history 字段重复（含义有歧义）时，
+//   - 槽指针无法解析、文本编码或 Unicode 转义损坏，或顶层 latest/history 字段重复（含义有歧义）时，
 //     返回带槽名的 *CorruptError：确认所需的当前标识与历史次序都无法确定，
 //     不按任意一份历史挑选来源，不产生新记录，也不修补指针。
 //   - 来源必须仍属于该槽、格式受支持、仍能通过内容与父关系校验且版本

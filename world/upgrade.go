@@ -174,7 +174,7 @@ func (a *Archive) checkUpgradeLocked(slot string, acceptedVersions []string, tar
 //
 // 目标规则非法返回 *RuleError；版本相同返回 *RuleError；来源损坏返回
 // *CorruptError；来源版本不在 acceptedVersions 内返回 *VersionRejectedError；
-// 槽不存在沿用现有不存在错误。槽指针无法解析，或顶层 latest/history 字段
+// 槽不存在沿用现有不存在错误。槽指针无法解析、文本编码或 Unicode 转义损坏，或顶层 latest/history 字段
 // 重复（含义有歧义）时也返回带槽名的 *CorruptError，且先于来源与版本判断。
 func (a *Archive) CheckUpgrade(slot string, acceptedVersions []string, target Rules) (UpgradeCheck, error) {
 	if !validSlotName(slot) {
@@ -200,7 +200,7 @@ func (a *Archive) CheckUpgrade(slot string, acceptedVersions []string, target Ru
 // 传入与 CheckUpgrade 相同的条件，并带调用方预期的最新记录标识 expected。
 // 提交时在排他锁下重新判断当前来源：仍有阻碍则返回相同的阻碍信息并拒绝
 // 写入；expected 为空或已不是该槽最新记录时返回现有冲突错误；槽指针无法
-// 解析或顶层 latest/history 字段重复（含义有歧义）时返回带槽名的
+// 解析、文本编码或 Unicode 转义损坏，或顶层 latest/history 字段重复（含义有歧义）时返回带槽名的
 // *CorruptError，不产生新记录也不修补指针。
 //
 // 被拒绝的升级不增加历史记录，也不改变槽当前记录。成功后槽增加一条完整

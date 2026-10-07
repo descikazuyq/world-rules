@@ -210,6 +210,18 @@ func validSlotName(slot string) bool {
 
 // readSlotPointerLocked 在调用方已持锁的前提下读取并解析槽指针文件。
 //
+// 文本编码检查先于一切解析与字段歧义判定，与记录文件共用同一标准：原始
+// 字节中只要含无效 UTF-8，或字符串（字段名、当前标识、历史标识或其他
+// 字符串）中的 Unicode 代理项转义没有正确配对——孤立的低位代理项、高位后
+// 没有紧接低位代理项都算——整份指针即损坏。encoding/json 本会把这些内容
+// 改写成替换字符“�”后继续解析，于是当前标识仍可能正确、被改写的历史标识
+// 只被浏览略过，损坏便被掩盖；因此必须按原始字节拒绝，绝不补成替换字符，
+// 也不按剩余历史继续寻找旧存档。所指记录全部完好、规则版本被接受也不豁免；
+// 这种指针报带槽名的 *CorruptError，原因说明文本编码或 Unicode 转义损坏，
+// 不报版本拒绝，也不报 ErrUnrecoverable。合法文本不受影响：真实写入的
+// “�”、中文、正确配对的代理项转义，以及转义反斜杠后的普通文字 uD800 都
+// 不是文本损坏。
+//
 // 除 JSON 语法外，还要检查顶层对象内 latest 与 history 两个字段是否各自
 // 重复出现：encoding/json 对同一字段静默采用后一个值（history 甚至整体
 // 替换前一份），于是读到的当前世界或可浏览的历史会随字段书写次序变化。
@@ -227,6 +239,12 @@ func (a *Archive) readSlotPointerLocked(slot string) (slotPointer, error) {
 			return slotPointer{}, &NotFoundError{Slot: slot}
 		}
 		return slotPointer{}, err
+	}
+	// 文本编码检查只依赖原始字节，先于重复字段检查与 Unmarshal：即使指针
+	// 同时有字段重复或类型错误，文本损坏也要明确按文本编码/转义损坏报告，
+	// 而不是笼统的无法解析。
+	if err := checkJSONText(data, "槽指针"); err != nil {
+		return slotPointer{}, &CorruptError{Slot: slot, Reason: err.Error()}
 	}
 	// 重复字段检查只依赖 JSON 语法结构（键与容器边界），不依赖值类型，因此
 	// 先于 Unmarshal 的类型错误：即使重复字段的某个值类型不对、解码失败，
@@ -353,7 +371,7 @@ func (a *Archive) readLatestLocked(slot string) (RecordID, error) {
 //
 // 首次保存会创建同名存档槽；槽名已存在时返回 *ConflictError。
 // 成功后返回新记录的标识，记录包含完整世界数据，且没有父记录。槽位上已
-// 有指针但无法解析或顶层字段重复（含义有歧义）时返回 *CorruptError，不把
+// 有指针但无法解析、文本编码或 Unicode 转义损坏，或顶层字段重复（含义有歧义）时返回 *CorruptError，不把
 // 该槽当作可写入的新槽或旧槽处理，也不创建任何记录。
 func (a *Archive) Save(slot string, w *World) (RecordInfo, error) {
 	if !validSlotName(slot) {
@@ -447,7 +465,7 @@ func (a *Archive) createSlotPointer(slot string, id RecordID) error {
 // 调用方传入的完整世界掩盖当前记录的问题，也不自动改选较老记录为父。
 // 新记录的父记录就是被覆盖的那次记录。同一目录下并发覆盖同一父记录时
 // 只有一个成功。被拒绝的覆盖不改变槽指向、历史与任何已有记录。槽指针
-// 无法解析，或顶层 latest/history 字段重复（含义有歧义）时按 *CorruptError
+// 无法解析、文本编码或 Unicode 转义损坏，或顶层 latest/history 字段重复（含义有歧义）时按 *CorruptError
 // 拒绝：无法确定当前记录与待承接的历史，不保存新记录，也不自动修补指针。
 func (a *Archive) Replace(slot string, w *World, expected RecordID) (RecordInfo, error) {
 	if !validSlotName(slot) {
@@ -520,9 +538,11 @@ func (a *Archive) replaceSlotPointer(slot string, id RecordID) error {
 // Branch 从 srcSlot 的指定历史记录 src 分出新槽 dstSlot。
 //
 // 新槽的首条记录以 src 为父记录，完整复制当时的种子、规则和状态。
-// 目标槽名已存在时返回 *ConflictError；目标槽指针无法解析或顶层字段重复
+// 目标槽名已存在时返回 *ConflictError；目标槽指针无法解析、文本编码或 Unicode
+// 转义损坏，或顶层字段重复
 // 时返回带目标槽名的 *CorruptError，不覆盖损坏槽也不在其中创建记录。
-// 源记录必须校验通过，且源槽指针必须可读：无法解析或顶层字段重复时返回
+// 源记录必须校验通过，且源槽指针必须可读：无法解析、文本编码或 Unicode 转义
+// 损坏，或顶层字段重复时返回
 // 带源槽名的 *CorruptError，无法确认来源属于该槽就不分出新槽。
 func (a *Archive) Branch(srcSlot string, src RecordID, dstSlot string) (RecordInfo, error) {
 	if !validSlotName(srcSlot) {

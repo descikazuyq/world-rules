@@ -4,7 +4,8 @@ package world
 // 规则升级与显式迁移共同的“转换前来源判断”：
 //
 //   - 只读取槽当前指向的最新记录，来源有问题时不改选更早的历史记录；槽不
-//     存在返回 *NotFoundError，槽指针无法解析返回 *CorruptError。
+//     存在返回 *NotFoundError，槽指针无法解析或文本编码、Unicode 转义
+//     损坏返回 *CorruptError。
 //   - 完整性检查（记录格式、标识一致性、内容校验和、直接父记录、世界状态
 //     自洽）不通过时返回带槽名与记录标识的 *CorruptError；来源文件缺失
 //     返回 *NotFoundError。

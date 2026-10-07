@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -155,7 +154,7 @@ func loadRecord(path string) (*envelope, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := checkRecordText(data); err != nil {
+	if err := checkJSONText(data, "记录"); err != nil {
 		return nil, err
 	}
 	var e envelope
@@ -407,15 +406,22 @@ func checkDuplicateNames(data []byte) error {
 	}
 }
 
-// checkRecordText 校验记录文件原始字节的文本编码：JSON 文本必须是合法
-// UTF-8；字符串值与对象键中的 \uXXXX 转义若是代理项，必须完整配对——
-// 高位代理项（D800–DBFF）后必须紧接一个低位代理项转义（DC00–DFFF），
-// 低位代理项不得单独出现。合法内容不受影响：真实存在的“�”、正确配对
-// 的代理项转义与同一字符的合法转义写法都照常接受；已经转义的反斜杠
-// （\\）其后的 uD800 只是普通文字，不是代理项转义。
-func checkRecordText(data []byte) error {
+// checkJSONText 校验一份 JSON 文件原始字节的文本编码：JSON 文本必须是
+// 合法 UTF-8；字符串值与对象键中的 \uXXXX 转义若是代理项，必须完整配对
+// ——高位代理项（D800–DBFF）后必须紧接一个低位代理项转义（DC00–DFFF），
+// 低位代理项不得单独出现。what 标明被检查的文件类别（如“记录”或“槽
+// 指针”），只用于错误说明；记录文件与槽指针文件共用同一判定。
+//
+// encoding/json 会把无效 UTF-8 字节和不成对的代理项转义悄悄改写成替换字符
+// “�”，因此必须在解析前按原始字节拒绝：若是记录，原文件本就含有的合法
+// “�”甚至可能让改写后的文本通过校验和检查；若是槽指针，改写后的当前标识
+// 仍可能指向一份完好记录、历史浏览也可能只略过改写后的标识，于是损坏被
+// 掩盖。合法内容不受影响：真实存在的“�”、正确配对的代理项转义与同一字符
+// 的合法转义写法都照常接受；已经转义的反斜杠（\\）其后的 uD800 只是普通
+// 文字，不是代理项转义。
+func checkJSONText(data []byte, what string) error {
 	if !utf8.Valid(data) {
-		return errors.New("记录包含无效 UTF-8 字节，文本编码损坏")
+		return fmt.Errorf("%s包含无效 UTF-8 字节，文本编码损坏", what)
 	}
 	// 只需定位字符串字面量并检查其中的 \u 转义；JSON 其余部分的合法性
 	// 由 json.Unmarshal 判断。data 已是合法 UTF-8，多字节字符中不可能
@@ -464,9 +470,9 @@ func checkRecordText(data []byte) error {
 						continue
 					}
 				}
-				return fmt.Errorf("记录包含未配对的高位代理项转义 \\u%04X，Unicode 转义损坏", v)
+				return fmt.Errorf("%s包含未配对的高位代理项转义 \\u%04X，Unicode 转义损坏", what, v)
 			case v >= 0xDC00 && v <= 0xDFFF:
-				return fmt.Errorf("记录包含单独出现的低位代理项转义 \\u%04X，Unicode 转义损坏", v)
+				return fmt.Errorf("%s包含单独出现的低位代理项转义 \\u%04X，Unicode 转义损坏", what, v)
 			}
 		}
 	}
