@@ -10,7 +10,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
+	"sync"
 	"unicode/utf8"
 )
 
@@ -167,106 +169,107 @@ func loadRecord(path string) (*envelope, error) {
 	return &e, nil
 }
 
-// recordObjectKind 标记记录中一类 JSON 对象按何种方式判定名称重复。
-type recordObjectKind int
+// recordShape 描述一类 JSON 对象按何种方式判定名称重复，以及它解码到的 Go
+// 类型。检查器认识的字段、字段的 JSON 名称与嵌套关系全部由真实记录结构
+// （envelope 及其引用的类型）经反射派生，不再为同一份结构手工维护第二份
+// 字段清单：结构体增删字段或调整嵌套时，重复检查自动随之变化。
+type recordShape struct {
+	t reflect.Type
+	// isMap 表示该对象解码到 map（携带上限 map[string]int）。map 的键是
+	// 真实业务标识而非固定字段，按还原后的精确名称比较；其余对象解码到
+	// 结构体，键按 encoding/json 的字段选择规则归并到固定字段。
+	isMap bool
+}
 
-const (
-	// 以下对象解码到结构体：键是结构体的固定字段名，与 encoding/json 的
-	// 字段选择相同，按大小写不敏感方式判定是否落到同一字段。
-	objEnvelope recordObjectKind = iota
-	objState
-	objRules
-	objEdge
-	objCharacter
-	objCharacterItem
-	// objMap 解码到 map（携带上限）：键是实际角色标识而非固定字段，必须
-	// 按还原后的精确名称区分，hero 与 HERO 是两个角色。
-	objMap
-	// objUnknown 是不属于记录结构的多余对象（如被忽略的未知字段值），
-	// 其中没有登记的固定字段，键按还原后的精确名称判定。
-	objUnknown
+// recordField 描述结构体某个固定字段的 JSON 名称与其值的容器形状。
+type recordField struct {
+	// name 是 encoding/json 实际匹配的名称：有 json 标签时用标签名
+	// （如 envelope 的 "format"），否则用 Go 字段名（如 State 的
+	// "Time"）。归并大小写变体时与该名称做大小写不敏感比较。
+	name string
+	// obj 为字段值是对象时给出值对象的形状；数组元素是对象时给出元素
+	// 对象的形状；二者皆非（标量、标量数组）时 ok 为 false。
+	obj recordShape
+	// ch 为 '{' 时 obj 描述对象值，为 '[' 时 obj 描述数组的对象元素，
+	// 为 0 时该字段不包含需要跟踪的对象。
+	ch byte
+}
+
+var (
+	recordShapeCache sync.Map // reflect.Type -> *recordStructShape
 )
 
-// recordFieldNames 列出每类结构体对象登记的固定字段名（Go 字段名），用于
-// 把 JSON 键按 encoding/json 的大小写不敏感规则归并到它会读取的字段上。
-var recordFieldNames = func() map[recordObjectKind][]string {
-	m := make(map[recordObjectKind][]string, len(recordSchema))
-	for kind, fields := range recordSchema {
-		names := make([]string, 0, len(fields))
-		for name := range fields {
-			names = append(names, name)
-		}
-		m[kind] = names
-	}
-	return m
-}()
+// recordStructShape 是一个结构体类型经反射得到的重复检查形状。
+type recordStructShape struct {
+	fields []recordField
+}
 
-// fieldIdentity 返回一个结构体对象内 JSON 键 key 的重复判定身份：若它会被
-// encoding/json 读取为某个固定字段（大小写不敏感，含 Unicode 转义还原后
-// 的写法），身份就是该字段名；否则 key 不对应任何固定字段，身份用还原后
-// 的精确名称，沿用“同一对象内同名出现第二次即损坏”的原有判定。
-func fieldIdentity(kind recordObjectKind, key string) string {
-	if kind != objMap {
-		for _, name := range recordFieldNames[kind] {
-			if strings.EqualFold(name, key) {
-				return name
+// structShapeOf 派生并缓存结构体类型 t 的形状：遍历其被 encoding/json
+// 读取的导出字段（无标签用字段名，有标签用标签名，跳过 "-"），并记录对象
+// 值字段、对象数组字段的嵌套形状。未在此列出的 JSON 键不对应任何固定字段，
+// 遍历时按还原后的精确名称判定，沿用“同一对象内同名出现第二次即损坏”。
+func structShapeOf(t reflect.Type) *recordStructShape {
+	if v, ok := recordShapeCache.Load(t); ok {
+		return v.(*recordStructShape)
+	}
+	s := &recordStructShape{}
+	for i := 0; i < t.NumField(); i++ {
+		sf := t.Field(i)
+		if sf.PkgPath != "" && !sf.Anonymous {
+			continue // 非导出字段不被 encoding/json 读取
+		}
+		name := sf.Name
+		if tag, ok := sf.Tag.Lookup("json"); ok {
+			opt := strings.Split(tag, ",")
+			if opt[0] == "-" {
+				continue
+			}
+			if opt[0] != "" {
+				name = opt[0]
 			}
 		}
+		// 匿名字段的提升（embedded）规则在记录结构中用不到：envelope
+		// 及其引用类型都没有匿名嵌套结构体，这里按普通命名字段处理即可。
+		f := recordField{name: name}
+		switch ft := sf.Type; ft.Kind() {
+		case reflect.Struct:
+			f.ch, f.obj = '{', recordShape{t: ft}
+		case reflect.Map:
+			// 记录结构中只有携带上限 map[string]int：键是角色标识。
+			f.ch, f.obj = '{', recordShape{t: ft, isMap: true}
+		case reflect.Slice, reflect.Array:
+			if et := ft.Elem(); et.Kind() == reflect.Struct {
+				f.ch, f.obj = '[', recordShape{t: et}
+			}
+		}
+		s.fields = append(s.fields, f)
 	}
-	return key
+	actual, _ := recordShapeCache.LoadOrStore(t, s)
+	return actual.(*recordStructShape)
 }
 
-// recordChildKind 描述某一结构体内某个固定字段值对应的 JSON 容器类型。
-type recordChildKind struct {
-	ch byte // 0 表示标量；'{' 表示对象，'[' 表示数组
-	// child 为 ch=='{' 时给出值对象的类型（结构体或携带上限 map）；
-	// elem 为 ch=='[' 时给出数组元素的对象类型，数组元素是标量时为 0。
-	child recordObjectKind
-	elem  recordObjectKind
+// matchField 按 encoding/json 的字段选择规则返回 JSON 键 key（已还原
+// Unicode 转义）在该结构体中会读取到的固定字段：大小写不敏感匹配字段的
+// JSON 名称（标签名或 Go 字段名）。无匹配时 ok 为 false。
+func (s *recordShape) matchField(key string) (recordField, bool) {
+	if s.t == nil || s.isMap {
+		// 未知对象没有登记任何固定字段；map 的键是业务标识而非固定字段。
+		return recordField{}, false
+	}
+	for _, f := range structShapeOf(s.t).fields {
+		if strings.EqualFold(f.name, key) {
+			return f, true
+		}
+	}
+	return recordField{}, false
 }
 
-// recordSchema 描述记录中会出现的结构体对象及其固定字段，键均为 Go 字段
-// 名（大写）。表与 envelope 及其引用的类型一一对应；新增固定字段时必须
-// 同步登记，否则重复检查可能漏判新字段的大小写变体。表中只登记容器类型
-// 的字段，标量字段只需出现在字段集合里、无需描述其值。
-var recordSchema = map[recordObjectKind]map[string]recordChildKind{
-	objEnvelope: {
-		"Format":    {},
-		"ID":        {},
-		"Parent":    {},
-		"SlotFirst": {},
-		"Checksum":  {},
-		"State":     {ch: '{', child: objState},
-	},
-	objState: {
-		"Seed":       {},
-		"Rules":      {ch: '{', child: objRules},
-		"Time":       {},
-		"Characters": {ch: '[', elem: objCharacter},
-	},
-	objRules: {
-		"Version":     {},
-		"Locations":   {},
-		"Edges":       {ch: '[', elem: objEdge},
-		"ItemKinds":   {},
-		"CarryLimits": {ch: '{', child: objMap}, // 解码到 map[string]int
-	},
-	objEdge: {
-		"From": {},
-		"To":   {},
-	},
-	objCharacter: {
-		"ID":       {},
-		"Location": {},
-		"Items":    {ch: '[', elem: objCharacterItem},
-	},
-	objCharacterItem: {
-		"Item":  {},
-		"Count": {},
-	},
-	// objMap 没有固定字段；其中的键是角色标识，不登记字段名。
-	objMap: {},
-}
+// envelopeShape 是重复名称检查的根形状，与 json.Unmarshal 解码的目标一致。
+var envelopeShape = recordShape{t: reflect.TypeOf(envelope{})}
+
+// unknownShape 用于不属于记录结构的多余对象（被忽略的未知字段值）：其中没有
+// 任何固定字段，键按还原后的精确名称判定。
+var unknownShape = recordShape{}
 
 // checkDuplicateNames 检查 JSON 文本中同一对象内的名称是否重复出现。
 //
@@ -290,38 +293,34 @@ func checkDuplicateNames(data []byte) error {
 	// UseNumber 避免数值范围差异：这里只关心对象结构与名称，不解释数值。
 	dec.UseNumber()
 	// frame 描述解析栈中的一层容器。对象记录已见过的名称身份：结构体对象
-	// 用 fieldIdentity 归并到它会读取到的固定字段名，map 与多余对象用还原
+	// 用 matchField 归并到它会读取到的固定字段名，map 与多余对象用还原
 	// 后的精确键；expectKey 跟踪下一个 token 是否为键。数组只占位并记录其
-	// 元素的对象类型，其中的字符串是值而不是名称。
+	// 元素的对象形状，其中的字符串是值而不是名称。
 	type frame struct {
 		isObj      bool
-		kind       recordObjectKind
-		elem       recordObjectKind // 仅数组帧使用：元素是对象时的对象类型
-		elemValid  bool             // 仅数组帧使用：该数组元素是否登记为对象
+		shape      recordShape
+		elem       recordShape // 仅数组帧使用：元素是对象时的形状
+		elemValid  bool        // 仅数组帧使用：该数组元素是否为登记对象
 		seen       map[string]bool
 		expectKey  bool
 		pendingKey string // 刚读入、其值尚未开始的键（对象帧使用）
 	}
-	// fieldKind 返回该对象的字段 field（大小写不敏感）在其值容器为 want
-	// （'{' 或 '['）时登记的子对象类型。
-	fieldKind := func(f *frame, field string, want byte) (recordObjectKind, bool) {
-		d, ok := recordSchema[f.kind][fieldIdentity(f.kind, field)]
-		if !ok || d.ch != want {
-			return 0, false
-		}
-		if want == '{' {
-			return d.child, true
-		}
-		return d.elem, d.elem != 0
-	}
 	var stack []*frame
-	pushObject := func(kind recordObjectKind) {
+	pushObject := func(shape recordShape) {
 		stack = append(stack, &frame{
 			isObj:     true,
-			kind:      kind,
+			shape:     shape,
 			seen:      make(map[string]bool),
 			expectKey: true,
 		})
+	}
+	// fieldOf 返回父对象键 key 对应的固定字段（按 encoding/json 的选择
+	// 规则归并大小写变体）。
+	fieldOf := func(parent *frame, key string) (recordField, bool) {
+		if parent.shape.isMap {
+			return recordField{}, false
+		}
+		return parent.shape.matchField(key)
 	}
 	// 一个值（标量或容器）结束后，父对象等待下一个键。
 	markValueDone := func() {
@@ -348,9 +347,13 @@ func checkDuplicateNames(data []byte) error {
 			parent := stack[n-1]
 			// 结构体按它会读取到的固定字段归并大小写变体；携带上限 map
 			// 与多余对象保留还原后的精确名称。
-			identity := fieldIdentity(parent.kind, key)
+			identity := key
+			fixedField := false
+			if f, ok := fieldOf(parent, key); ok {
+				identity, fixedField = f.name, true
+			}
 			if parent.seen[identity] {
-				if parent.kind == objMap || parent.kind == objUnknown {
+				if !fixedField {
 					return fmt.Errorf("同一对象内名称 %q 重复出现", key)
 				}
 				return fmt.Errorf("同一对象内名称 %q 重复出现：与先前某名称会被读取为同一个固定字段", key)
@@ -367,34 +370,35 @@ func checkDuplicateNames(data []byte) error {
 		}
 		switch d {
 		case '{':
-			kind := objUnknown
+			shape := unknownShape
 			if n := len(stack); n > 0 {
 				parent := stack[n-1]
 				switch {
 				case parent.isObj:
-					// 父对象键对应的值对象：类型由模式表给出（如 State、
-					// Rules 是结构体，CarryLimits 是 map）。未登记的是被
-					// 结构体忽略的多余字段，按未知对象处理。
-					if k, ok := fieldKind(parent, parent.pendingKey, '{'); ok {
-						kind = k
+					// 父对象键对应的值对象：形状由结构体派生的字段信息
+					// 给出（如 State、Rules 是结构体，CarryLimits 是
+					// map）。未登记的是被结构体忽略的多余字段，按未知
+					// 对象处理。
+					if f, ok := fieldOf(parent, parent.pendingKey); ok && f.ch == '{' {
+						shape = f.obj
 					}
 				case parent.elemValid:
-					// 数组中的对象元素：结构体类型由数组帧登记。
-					kind = parent.elem
+					// 数组中的对象元素：形状由数组帧登记。
+					shape = parent.elem
 				}
 			} else {
 				// 根对象是记录信封。
-				kind = objEnvelope
+				shape = envelopeShape
 			}
 			markValueDone()
-			pushObject(kind)
+			pushObject(shape)
 		case '[':
-			var elem recordObjectKind
+			var elem recordShape
 			var valid bool
 			if n := len(stack); n > 0 && stack[n-1].isObj {
 				parent := stack[n-1]
-				if d, ok := recordSchema[parent.kind][fieldIdentity(parent.kind, parent.pendingKey)]; ok && d.ch == '[' {
-					elem, valid = d.elem, d.elem != 0
+				if f, ok := fieldOf(parent, parent.pendingKey); ok && f.ch == '[' {
+					elem, valid = f.obj, true
 				}
 			}
 			markValueDone()
