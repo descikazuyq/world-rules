@@ -1,11 +1,13 @@
 package world
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // RecordInfo 描述一次保存产生的记录的元信息。
@@ -33,6 +35,12 @@ type RecordInfo struct {
 //
 // 旧版本写出的指针没有 History 字段；读取时会在内存中按校验通过的父链
 // 回退重建，不要求用户转换数据。
+//
+// 顶层对象内 latest、history 各自只允许出现一次：完全同名、只改大小写或
+// Unicode 转义还原后对应同一字段的两个名称都算重复（encoding/json 本会
+// 静默采用后一个值），出现歧义时整份指针按损坏拒绝，而不是选一个值继续。
+// 缺少 History 不违反这条规则；History 数组内部的重复标识是另一回事，由
+// 读取侧按首次出现次序去重。
 type slotPointer struct {
 	Latest  RecordID   `json:"latest"`
 	History []RecordID `json:"history,omitempty"`
@@ -201,6 +209,17 @@ func validSlotName(slot string) bool {
 }
 
 // readSlotPointerLocked 在调用方已持锁的前提下读取并解析槽指针文件。
+//
+// 除 JSON 语法外，还要检查顶层对象内 latest 与 history 两个字段是否各自
+// 重复出现：encoding/json 对同一字段静默采用后一个值（history 甚至整体
+// 替换前一份），于是读到的当前世界或可浏览的历史会随字段书写次序变化。
+// 出现这种歧义时整个指针按损坏拒绝，绝不选其中一个值继续；判定方式与
+// encoding/json 选择字段一致——完全同名、只改大小写的写法，以及 Unicode
+// 转义还原后对应同一字段的写法都算同一字段重复，两个值相同、其中一个为
+// 空、后一份历史更完整或所指记录校验通过都不豁免，交换先后次序同样损坏。
+// 名称只出现一次时，本就可接受的大小写与转义写法照常读取；缺少 history
+// 是旧版本合法指针，不算重复。history 数组内部同一记录标识重复出现属于
+// 另一回事，沿用既有的去重与次序规则。
 func (a *Archive) readSlotPointerLocked(slot string) (slotPointer, error) {
 	data, err := os.ReadFile(a.slotPath(slot))
 	if err != nil {
@@ -208,6 +227,15 @@ func (a *Archive) readSlotPointerLocked(slot string) (slotPointer, error) {
 			return slotPointer{}, &NotFoundError{Slot: slot}
 		}
 		return slotPointer{}, err
+	}
+	// 重复字段检查只依赖 JSON 语法结构（键与容器边界），不依赖值类型，因此
+	// 先于 Unmarshal 的类型错误：即使重复字段的某个值类型不对、解码失败，
+	// 也要明确报字段重复，而不是笼统的无法解析。
+	if dup, ok := duplicatePointerField(data); ok {
+		return slotPointer{}, &CorruptError{
+			Slot:   slot,
+			Reason: fmt.Sprintf("槽指针字段 %q 重复出现：同一对象内有两个名称会被读取为该字段，槽指针含义有歧义", dup),
+		}
 	}
 	var p slotPointer
 	if err := json.Unmarshal(data, &p); err != nil {
@@ -217,6 +245,99 @@ func (a *Archive) readSlotPointerLocked(slot string) (slotPointer, error) {
 		return slotPointer{}, &CorruptError{Slot: slot, Reason: "槽指针为空"}
 	}
 	return p, nil
+}
+
+// duplicatePointerField 检查槽指针 JSON 顶层对象内 latest、history 两个
+// 固定字段是否各自重复出现。槽指针是只有这两个字段的扁平对象，检查只需
+// 遍历顶层键、不进入任何值容器；history 数组元素是值而非字段名，数组内
+// 同一记录标识重复出现不在此判定。
+//
+// 键按 JSON 转义还原后的字符串与字段标签做大小写不敏感匹配，与
+// encoding/json 对结构体字段的选择一致：因此 "latest" 与 "Latest"、
+// "history" 与写作 Unicode 转义形式的同一名称（如 "latest"）都会
+// 归并到同一字段，任一字段第二次出现即返回该字段标签。文本已通过
+// json.Unmarshal，这里不会再遇到语法问题。
+func duplicatePointerField(data []byte) (string, bool) {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	tok, err := dec.Token()
+	if err != nil {
+		return "", false
+	}
+	d, ok := tok.(json.Delim)
+	if !ok || d != '{' {
+		return "", false
+	}
+	seen := map[string]bool{}
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			return "", false
+		}
+		if d, ok := tok.(json.Delim); ok && d == '}' {
+			return "", false
+		}
+		key, ok := tok.(string)
+		if !ok {
+			return "", false
+		}
+		field := ""
+		switch {
+		case strings.EqualFold(key, "latest"):
+			field = "latest"
+		case strings.EqualFold(key, "history"):
+			field = "history"
+		}
+		if field != "" {
+			if seen[field] {
+				return field, true
+			}
+			seen[field] = true
+		}
+		// 跳过该键对应的值（标量直接取下一个 token；数组或对象整体跳过），
+		// 使下一轮仍停留在顶层键或右花括号上。
+		if err := skipJSONValue(dec); err != nil {
+			return "", false
+		}
+	}
+}
+
+// skipJSONValue 消费刚读入键之后的那一个 JSON 值：标量只需再读一个 token，
+// 数组或对象按配对的分隔符整体跳过，不把其中内容当作顶层字段。
+func skipJSONValue(dec *json.Decoder) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	d, ok := tok.(json.Delim)
+	if !ok {
+		return nil
+	}
+	var open, close byte
+	switch d {
+	case '{':
+		open, close = '{', '}'
+	case '[':
+		open, close = '[', ']'
+	default:
+		return nil
+	}
+	depth := 1
+	for depth > 0 {
+		t, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		if td, ok := t.(json.Delim); ok {
+			switch byte(td) {
+			case open:
+				depth++
+			case close:
+				depth--
+			}
+		}
+	}
+	return nil
 }
 
 // readLatestLocked 在调用方已持锁的前提下读取槽当前最新记录标识。
@@ -231,7 +352,9 @@ func (a *Archive) readLatestLocked(slot string) (RecordID, error) {
 // Save 在存档中保存一个世界。
 //
 // 首次保存会创建同名存档槽；槽名已存在时返回 *ConflictError。
-// 成功后返回新记录的标识，记录包含完整世界数据，且没有父记录。
+// 成功后返回新记录的标识，记录包含完整世界数据，且没有父记录。槽位上已
+// 有指针但无法解析或顶层字段重复（含义有歧义）时返回 *CorruptError，不把
+// 该槽当作可写入的新槽或旧槽处理，也不创建任何记录。
 func (a *Archive) Save(slot string, w *World) (RecordInfo, error) {
 	if !validSlotName(slot) {
 		return RecordInfo{}, &ConflictError{Slot: slot, Reason: "非法存档槽名"}
@@ -323,7 +446,9 @@ func (a *Archive) createSlotPointer(slot string, id RecordID) error {
 // *CorruptError。绝不用
 // 调用方传入的完整世界掩盖当前记录的问题，也不自动改选较老记录为父。
 // 新记录的父记录就是被覆盖的那次记录。同一目录下并发覆盖同一父记录时
-// 只有一个成功。被拒绝的覆盖不改变槽指向、历史与任何已有记录。
+// 只有一个成功。被拒绝的覆盖不改变槽指向、历史与任何已有记录。槽指针
+// 无法解析，或顶层 latest/history 字段重复（含义有歧义）时按 *CorruptError
+// 拒绝：无法确定当前记录与待承接的历史，不保存新记录，也不自动修补指针。
 func (a *Archive) Replace(slot string, w *World, expected RecordID) (RecordInfo, error) {
 	if !validSlotName(slot) {
 		return RecordInfo{}, &ConflictError{Slot: slot, Reason: "非法存档槽名"}
@@ -395,7 +520,10 @@ func (a *Archive) replaceSlotPointer(slot string, id RecordID) error {
 // Branch 从 srcSlot 的指定历史记录 src 分出新槽 dstSlot。
 //
 // 新槽的首条记录以 src 为父记录，完整复制当时的种子、规则和状态。
-// 目标槽名已存在时返回 *ConflictError。源记录必须校验通过。
+// 目标槽名已存在时返回 *ConflictError；目标槽指针无法解析或顶层字段重复
+// 时返回带目标槽名的 *CorruptError，不覆盖损坏槽也不在其中创建记录。
+// 源记录必须校验通过，且源槽指针必须可读：无法解析或顶层字段重复时返回
+// 带源槽名的 *CorruptError，无法确认来源属于该槽就不分出新槽。
 func (a *Archive) Branch(srcSlot string, src RecordID, dstSlot string) (RecordInfo, error) {
 	if !validSlotName(srcSlot) {
 		return RecordInfo{}, &ConflictError{Slot: srcSlot, Reason: "非法源存档槽名"}

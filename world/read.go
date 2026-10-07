@@ -130,9 +130,11 @@ func envToRecord(env *envelope) Record {
 // acceptedVersions 是调用方明确给出的可接受规则版本集合：记录完好但
 // 版本不在集合内时返回 *VersionRejectedError；记录损坏（文本编码或
 // Unicode 转义损坏、同一对象内名称重复、格式版本不受支持、校验和不符、
-// 父记录缺失、无法解析、时间片为负）时返回 *CorruptError。文本损坏、
-// 名称重复与格式问题都先于版本判断：即使版本不被接受，损坏的记录也报
-// 损坏而不报版本拒绝。
+// 父记录缺失、无法解析、时间片为负）时返回 *CorruptError。槽指针本身
+// 无法解析，或顶层 latest/history 字段重复出现（含义有歧义）时同样返回
+// 带槽名的 *CorruptError，且不继续读取任何记录。文本损坏、名称重复与
+// 格式问题都先于版本判断：即使版本不被接受，损坏的记录或指针也报损坏
+// 而不报版本拒绝。
 // 读取不会改写存档。
 func (a *Archive) Latest(slot string, acceptedVersions []string) (Record, error) {
 	if !validSlotName(slot) {
@@ -170,8 +172,10 @@ func (a *Archive) Latest(slot string, acceptedVersions []string) (Record, error)
 // 旧记录仍可按其标识读取）。
 //
 // 与 Latest 一样检查记录格式版本、内容校验和（含父记录关系）与规则版本，
-// 且记录必须属于该槽的历史链。acceptedVersions 必须显式给出调用方可以
-// 接受的规则版本：记录完好但版本不在集合内时返回 *VersionRejectedError。
+// 且记录必须属于该槽的历史链：因此槽指针无法解析或顶层 latest/history
+// 字段重复时，即使所按标识的记录本身完好，也先返回带槽名的 *CorruptError，
+// 不交付该记录。acceptedVersions 必须显式给出调用方可以接受的规则版本：
+// 记录完好但版本不在集合内时返回 *VersionRejectedError。
 // 读取不会切换槽当前记录，不会修补记录，也不会替换记录中的规则版本。
 func (a *Archive) Record(slot string, id RecordID, acceptedVersions []string) (Record, error) {
 	if !validSlotName(slot) {
@@ -235,9 +239,10 @@ func (a *Archive) Record(slot string, id RecordID, acceptedVersions []string) (R
 // 处停止，不能承诺越过损坏处继续寻找更老的记录。
 //
 // 槽存在但没有任何合格记录时，返回成功的非 nil 空列表；槽不存在返回
-// *NotFoundError，槽指针无法解析返回 *CorruptError，三者互不等同，不能把
-// 不存在或损坏当成空列表。浏览只做只读遍历，不切换槽当前记录、不修补或
-// 删除记录、不改写历史与世界规则。
+// *NotFoundError，槽指针无法解析（含顶层 latest/history 字段重复）返回
+// *CorruptError，三者互不等同，不能把不存在或损坏当成空列表。槽指针
+// 字段重复时不返回任何历史列表，也不按其中任意一份历史继续浏览。浏览只做
+// 只读遍历，不切换槽当前记录、不修补或删除记录、不改写历史与世界规则。
 func (a *Archive) History(slot string) ([]RecordInfo, error) {
 	if !validSlotName(slot) {
 		return nil, &NotFoundError{Slot: slot}
@@ -288,7 +293,9 @@ func (a *Archive) History(slot string) ([]RecordInfo, error) {
 // 生效）的记录才在候选中：残留临时文件、写完但尚未完成保存的孤儿记录
 // 不会被选中。
 //
-// 槽不存在返回 *NotFoundError；槽指针不可读返回 *CorruptError；槽中没有
+// 槽不存在返回 *NotFoundError；槽指针不可读（无法解析，或顶层
+// latest/history 字段重复导致含义有歧义）返回带槽名的 *CorruptError，
+// 字段重复时不按任意一份历史继续查找旧记录，也不改报不可恢复；槽中没有
 // 任何版本可接受的完好记录时返回包装了 ErrUnrecoverable 的
 // *UnrecoverableError，可用 errors.Is(err, ErrUnrecoverable) 判断。
 // 恢复读取不会改写槽、指针、历史记录或规则，重复读取也不消耗历史。
