@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -407,15 +406,28 @@ func checkDuplicateNames(data []byte) error {
 	}
 }
 
-// checkRecordText 校验记录文件原始字节的文本编码：JSON 文本必须是合法
+// checkRecordText 校验记录文件原始字节的文本编码，规则见 checkJSONText。
+func checkRecordText(data []byte) error {
+	return checkJSONText(data, "记录")
+}
+
+// checkSlotPointerText 校验槽指针文件原始字节的文本编码，规则见
+// checkJSONText。槽指针与记录一样会被 encoding/json 悄悄改写损坏文本，
+// 因此必须在解析前按原始字节拒绝。
+func checkSlotPointerText(data []byte) error {
+	return checkJSONText(data, "槽指针")
+}
+
+// checkJSONText 校验 JSON 文本原始字节的文本编码：文本必须是合法
 // UTF-8；字符串值与对象键中的 \uXXXX 转义若是代理项，必须完整配对——
 // 高位代理项（D800–DBFF）后必须紧接一个低位代理项转义（DC00–DFFF），
 // 低位代理项不得单独出现。合法内容不受影响：真实存在的“�”、正确配对
 // 的代理项转义与同一字符的合法转义写法都照常接受；已经转义的反斜杠
-// （\\）其后的 uD800 只是普通文字，不是代理项转义。
-func checkRecordText(data []byte) error {
+// （\\）其后的 uD800 只是普通文字，不是代理项转义。what 是出错原因中
+// 对这份文本的称呼（如“记录”“槽指针”）。
+func checkJSONText(data []byte, what string) error {
 	if !utf8.Valid(data) {
-		return errors.New("记录包含无效 UTF-8 字节，文本编码损坏")
+		return fmt.Errorf("%s包含无效 UTF-8 字节，文本编码损坏", what)
 	}
 	// 只需定位字符串字面量并检查其中的 \u 转义；JSON 其余部分的合法性
 	// 由 json.Unmarshal 判断。data 已是合法 UTF-8，多字节字符中不可能
@@ -464,9 +476,9 @@ func checkRecordText(data []byte) error {
 						continue
 					}
 				}
-				return fmt.Errorf("记录包含未配对的高位代理项转义 \\u%04X，Unicode 转义损坏", v)
+				return fmt.Errorf("%s包含未配对的高位代理项转义 \\u%04X，Unicode 转义损坏", what, v)
 			case v >= 0xDC00 && v <= 0xDFFF:
-				return fmt.Errorf("记录包含单独出现的低位代理项转义 \\u%04X，Unicode 转义损坏", v)
+				return fmt.Errorf("%s包含单独出现的低位代理项转义 \\u%04X，Unicode 转义损坏", what, v)
 			}
 		}
 	}

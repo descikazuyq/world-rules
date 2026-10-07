@@ -36,6 +36,10 @@ type RecordInfo struct {
 // 旧版本写出的指针没有 History 字段；读取时会在内存中按校验通过的父链
 // 回退重建，不要求用户转换数据。
 //
+// 指针原始字节含无效 UTF-8，或字符串中的 Unicode 代理项转义未正确配对时，
+// 整份指针按文本损坏拒绝（与记录文件同一套检查），绝不用替换字符“�”改写
+// 后的内容继续读取。
+//
 // 顶层对象内 latest、history 各自只允许出现一次：完全同名、只改大小写或
 // Unicode 转义还原后对应同一字段的两个名称都算重复（encoding/json 本会
 // 静默采用后一个值），出现歧义时整份指针按损坏拒绝，而不是选一个值继续。
@@ -210,6 +214,15 @@ func validSlotName(slot string) bool {
 
 // readSlotPointerLocked 在调用方已持锁的前提下读取并解析槽指针文件。
 //
+// 解析前先做文本编码检查（与记录文件同一套规则）：原始字节含无效 UTF-8，
+// 或字符串中的 Unicode 代理项转义未正确配对（孤立的低位代理项、高位代理项
+// 后没有紧接低位代理项），无论出现在字段名、当前标识、历史标识还是其他
+// 字符串中，整份指针都按损坏拒绝，返回带槽名的 *CorruptError——encoding/json
+// 会把这些内容悄悄改写成替换字符“�”后继续解码，绝不允许用改写后的标识
+// 读取当前记录或浏览历史，也不按指针里剩余的完好部分继续寻找旧记录。真实
+// 写入的“�”、中文、正确配对的代理项转义，以及转义后的反斜杠后跟普通文字
+// uD800 都是合法文本，照常接受。
+//
 // 除 JSON 语法外，还要检查顶层对象内 latest 与 history 两个字段是否各自
 // 重复出现：encoding/json 对同一字段静默采用后一个值（history 甚至整体
 // 替换前一份），于是读到的当前世界或可浏览的历史会随字段书写次序变化。
@@ -227,6 +240,11 @@ func (a *Archive) readSlotPointerLocked(slot string) (slotPointer, error) {
 			return slotPointer{}, &NotFoundError{Slot: slot}
 		}
 		return slotPointer{}, err
+	}
+	// 文本编码检查先于一切解析：encoding/json 会把无效 UTF-8 字节与不成对
+	// 的代理项转义改写成替换字符后继续，损坏的字段名或记录标识会被掩盖。
+	if err := checkSlotPointerText(data); err != nil {
+		return slotPointer{}, &CorruptError{Slot: slot, Reason: err.Error()}
 	}
 	// 重复字段检查只依赖 JSON 语法结构（键与容器边界），不依赖值类型，因此
 	// 先于 Unmarshal 的类型错误：即使重复字段的某个值类型不对、解码失败，
