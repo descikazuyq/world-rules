@@ -1,11 +1,13 @@
 package world
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // RecordInfo 描述一次保存产生的记录的元信息。
@@ -33,6 +35,10 @@ type RecordInfo struct {
 //
 // 旧版本写出的指针没有 History 字段；读取时会在内存中按校验通过的父链
 // 回退重建，不要求用户转换数据。
+//
+// 顶层同一对象内两个名称会被解释为同一个 latest 或 history 字段时（同名、
+// 仅大小写不同或 Unicode 转义还原后同名），整个指针按损坏拒绝，绝不取后
+// 一个值继续使用；缺少 History 不算重复。
 type slotPointer struct {
 	Latest  RecordID   `json:"latest"`
 	History []RecordID `json:"history,omitempty"`
@@ -200,6 +206,123 @@ func validSlotName(slot string) bool {
 	return filepath.Clean(slot) == slot
 }
 
+// slotPointerFields 列出槽指针顶层登记的固定字段 JSON 名（小写），用于
+// 按 encoding/json 的字段选择规则（大小写不敏感、Unicode 转义还原后再比较）
+// 把顶层键归并到它实际会读取的字段上。
+var slotPointerFields = []string{"latest", "history"}
+
+// checkSlotPointerDuplicateFields 检查槽指针 JSON 顶层对象内是否有两个名称
+// 会被现有读取方式解释为同一个固定字段 latest 或 history。
+//
+// encoding/json 对同名字段静默采用后一个值：同一指针里 "latest" 写两次时
+// 前一个值会被后一个覆盖，"history" 重复出现时后一份历史会替换前一份，
+// 于是读到的当前世界或可恢复历史会随字段书写次序变化。出现这种歧义时
+// 必须明确拒绝整个指针，不能选一个值继续使用。
+//
+// 判定与读取方式保持一致：JSON 键先按 Unicode 转义还原，再做大小写不敏感
+// 比较，因此完全相同的名称、只改变大小写的写法（"Latest" 与 "latest"）
+// 以及 Unicode 转义还原后对应同一字段的写法（直接写出的 "latest" 与写作
+// 转义形式的 "\u006catest"）都算同一字段。只检查指针顶层对象：数组元素与
+// 嵌套对象中的键不参与，history 数组里同一记录标识出现多次属于另一种情况
+// （由后续去重处理）。
+func checkSlotPointerDuplicateFields(data []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	// 只遍历顶层对象：读取根 '{'、逐键消费其值（可能是标量或容器），
+	// 遇到根 '}' 即结束。嵌套对象/数组内部的名称不影响指针字段判定。
+	if err := expectPointerToken(dec, '{'); err != nil {
+		return err
+	}
+	seen := make(map[string]bool)
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		if d, ok := tok.(json.Delim); ok && d == '}' {
+			return nil
+		}
+		key, ok := tok.(string)
+		if !ok {
+			// 文本已通过 json.Unmarshal，键位置必为字符串；兜底按解析
+			// 问题处理，不与“字段重复”混淆。
+			return fmt.Errorf("槽指针键不是字符串")
+		}
+		identity := slotPointerFieldIdentity(key)
+		if identity != "" {
+			if seen[identity] {
+				return errSlotPointerDuplicate
+			}
+			seen[identity] = true
+		}
+		if err := skipJSONValue(dec); err != nil {
+			return err
+		}
+	}
+}
+
+// errSlotPointerDuplicate 是内部哨兵错误，仅用于区分“字段重复”与遍历
+// 槽指针令牌时遇到的其它解析问题（后者统一按“无法解析”处理）。
+var errSlotPointerDuplicate = errors.New("槽指针字段重复")
+
+// slotPointerFieldIdentity 返回顶层键 key 会读取到的固定字段名（"latest"
+// 或 "history"）；键不对应任何登记字段时返回空串。
+func slotPointerFieldIdentity(key string) string {
+	for _, name := range slotPointerFields {
+		if strings.EqualFold(name, key) {
+			return name
+		}
+	}
+	return ""
+}
+
+// expectPointerToken 从 dec 读取下一个令牌并断言它是 want。
+func expectPointerToken(dec *json.Decoder, want json.Delim) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	d, ok := tok.(json.Delim)
+	if !ok || d != want {
+		return fmt.Errorf("槽指针不是 JSON 对象")
+	}
+	return nil
+}
+
+// skipJSONValue 消费当前键对应的值：标量令牌本身即值；对象与数组递归跳过
+// 到配对的闭合分隔符。调用时下一个令牌尚未读取。
+func skipJSONValue(dec *json.Decoder) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	d, ok := tok.(json.Delim)
+	if !ok {
+		return nil // 标量值
+	}
+	switch d {
+	case '{', '[':
+		depth := 1
+		for depth > 0 {
+			tok, err := dec.Token()
+			if err != nil {
+				return err
+			}
+			if inner, isDelim := tok.(json.Delim); isDelim {
+				if inner == '{' || inner == '[' {
+					depth++
+				} else {
+					depth--
+				}
+			}
+		}
+		return nil
+	default:
+		// 值位置不应直接出现闭合分隔符；交给调用路径按损坏处理。
+		return fmt.Errorf("槽指针值缺失")
+	}
+}
+
 // readSlotPointerLocked 在调用方已持锁的前提下读取并解析槽指针文件。
 func (a *Archive) readSlotPointerLocked(slot string) (slotPointer, error) {
 	data, err := os.ReadFile(a.slotPath(slot))
@@ -211,6 +334,15 @@ func (a *Archive) readSlotPointerLocked(slot string) (slotPointer, error) {
 	}
 	var p slotPointer
 	if err := json.Unmarshal(data, &p); err != nil {
+		return slotPointer{}, &CorruptError{Slot: slot, Reason: "槽指针无法解析"}
+	}
+	// 解析通过后再判重复：encoding/json 会静默采用后一个同名值，重复的
+	// latest/history 会让读到的当前记录与历史随字段次序变化，必须把整个
+	// 指针认定为损坏，绝不选其中一个值继续使用。缺少 history 不算重复。
+	if err := checkSlotPointerDuplicateFields(data); err != nil {
+		if errors.Is(err, errSlotPointerDuplicate) {
+			return slotPointer{}, &CorruptError{Slot: slot, Reason: "槽指针字段重复: 同一对象内 latest 或 history 出现两次"}
+		}
 		return slotPointer{}, &CorruptError{Slot: slot, Reason: "槽指针无法解析"}
 	}
 	if p.Latest == "" {
